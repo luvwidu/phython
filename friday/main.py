@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 
 try:
     from dotenv import load_dotenv
@@ -29,8 +30,23 @@ from claude_agent_sdk import (
 )
 
 from .agents import REGISTRY
+from .config import load_mcp_config
 from .prompts import SYSTEM_PROMPT
+from .tasks import store
 from .tools import ALLOWED_TOOLS, build_server
+from .watcher import resume_all as resume_watchers
+
+
+def _surface_notifications() -> None:
+    notifs = store.pop_notifications()
+    if not notifs:
+        return
+    print()
+    print("─── 알림 ───")
+    for n in notifs:
+        ts = time.strftime("%H:%M:%S", time.localtime(n.get("ts", time.time())))
+        print(f"[{ts}] {n.get('text', '')}")
+    print("────────────")
 
 
 def _render(msg) -> None:
@@ -49,10 +65,11 @@ def _render(msg) -> None:
 
 async def repl() -> None:
     server = build_server()
+    extra_servers, extra_allowed, source = load_mcp_config()
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
-        mcp_servers={"friday": server},
-        allowed_tools=ALLOWED_TOOLS,
+        mcp_servers={"friday": server, **extra_servers},
+        allowed_tools=ALLOWED_TOOLS + extra_allowed,
         agents=REGISTRY,
         model="claude-opus-4-7",
         permission_mode="default",
@@ -60,8 +77,12 @@ async def repl() -> None:
     )
 
     print("Friday — central orchestrator. Type a request, or 'exit' to quit.")
+    if source:
+        print(f"  loaded {len(extra_servers)} external MCP server(s) from {source}")
+    resume_watchers()
     async with ClaudeSDKClient(options=options) as client:
         while True:
+            _surface_notifications()
             try:
                 user_input = (await asyncio.to_thread(input, "\nyou> ")).strip()
             except (EOFError, KeyboardInterrupt):

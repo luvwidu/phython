@@ -11,6 +11,7 @@ from typing import Literal, Optional
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 TASKS_FILE = DATA_DIR / "tasks.json"
 JOBS_FILE = DATA_DIR / "jobs.json"
+NOTIFS_FILE = DATA_DIR / "notifications.jsonl"
 
 TaskStatus = Literal["pending", "in_progress", "blocked", "done", "cancelled"]
 JobStatus = Literal["running", "succeeded", "failed", "cancelled"]
@@ -134,6 +135,24 @@ class Store:
 
     def get_job(self, jid: str) -> Optional[Job]:
         return self._jobs.get(jid)
+
+    def append_notification(self, text: str) -> None:
+        line = json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False)
+        with NOTIFS_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    def pop_notifications(self) -> list[dict]:
+        if not NOTIFS_FILE.exists():
+            return []
+        raw = NOTIFS_FILE.read_text(encoding="utf-8").strip()
+        NOTIFS_FILE.write_text("", encoding="utf-8")
+        out: list[dict] = []
+        for ln in raw.splitlines():
+            try:
+                out.append(json.loads(ln))
+            except json.JSONDecodeError:
+                continue
+        return out
 
 
 store = Store()

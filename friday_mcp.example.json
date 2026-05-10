@@ -1,0 +1,27 @@
+{
+  "_comment": "Copy to friday_mcp.json (gitignored) and fill in. See friday/config.py.",
+  "servers": {
+    "gmail": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-gmail"],
+      "env": {
+        "GMAIL_OAUTH_TOKEN": "..."
+      }
+    },
+    "calendar": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-google-calendar"],
+      "env": {
+        "GOOGLE_CALENDAR_TOKEN": "..."
+      }
+    }
+  },
+  "allowed_tools": [
+    "mcp__gmail__search_threads",
+    "mcp__gmail__create_draft",
+    "mcp__calendar__list_events",
+    "mcp__calendar__create_event"
+  ]
+}

@@ -1,21 +1,30 @@
-"""Custom MCP tools for the central orchestrator.
+"""Custom MCP tools for Friday.
 
-These tools let the orchestrator manage a shared task list and dispatch
-work into other repositories as background Claude Code jobs.
+These tools let Friday manage a shared task list and run / converse with
+background Claude Code jobs that live inside other repositories.
 """
 from __future__ import annotations
 
 import asyncio
 import time
 from pathlib import Path
+from typing import Optional
 
-from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, query, tool
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    create_sdk_mcp_server,
+    tool,
+)
 
 from .tasks import store
 
 
 def _ok(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}]}
+
+
+# --- task tools -----------------------------------------------------------
 
 
 @tool(
@@ -86,50 +95,102 @@ async def get_task(args):
     )
 
 
-# --- background dispatch into another repo ---------------------------------
-
-_BG_TASKS: dict[str, asyncio.Task] = {}
+# --- background dispatch jobs --------------------------------------------
 
 
 def _msg_to_text(msg) -> str:
+    parts: list[str] = []
     content = getattr(msg, "content", None)
     if isinstance(content, list):
-        out: list[str] = []
         for block in content:
             text = getattr(block, "text", None)
             if text:
-                out.append(text)
-        if out:
-            return "\n".join(out)
-    return ""
+                parts.append(text)
+                continue
+            name = getattr(block, "name", None)
+            if name:
+                parts.append(f"→ tool: {name}")
+    return "\n".join(parts)
 
 
-async def _run_dispatch(job_id: str, repo_path: str, instruction: str) -> None:
-    try:
-        opts = ClaudeAgentOptions(
-            cwd=repo_path,
-            permission_mode="acceptEdits",
-            setting_sources=["project", "user"],
-        )
-        async for msg in query(prompt=instruction, options=opts):
+def _notify(job_id: str, text: str) -> None:
+    """Append a notification line for the REPL to surface on next prompt."""
+    store.append_notification(f"[job {job_id}] {text}")
+
+
+class JobRunner:
+    """Holds a long-lived ClaudeSDKClient and a queue for follow-up messages."""
+
+    def __init__(self, job_id: str, repo_path: str, instruction: str) -> None:
+        self.job_id = job_id
+        self.repo_path = repo_path
+        self.initial_instruction = instruction
+        self.queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        self.task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        self.task = asyncio.create_task(self._run())
+
+    async def _drain_response(self, client: ClaudeSDKClient) -> None:
+        async for msg in client.receive_response():
             text = _msg_to_text(msg)
             if text:
-                store.append_job_output(job_id, text)
-        store.update_job(
-            job_id, status="succeeded", finished_at=time.time(), summary="completed"
-        )
-    except Exception as e:  # noqa: BLE001
-        store.update_job(
-            job_id, status="failed", finished_at=time.time(), summary=f"error: {e}"
-        )
-    finally:
-        _BG_TASKS.pop(job_id, None)
+                store.append_job_output(self.job_id, text)
+
+    async def _run(self) -> None:
+        try:
+            opts = ClaudeAgentOptions(
+                cwd=self.repo_path,
+                permission_mode="acceptEdits",
+                setting_sources=["project", "user"],
+            )
+            async with ClaudeSDKClient(options=opts) as client:
+                await client.query(self.initial_instruction)
+                await self._drain_response(client)
+                while True:
+                    next_msg = await self.queue.get()
+                    if next_msg is None:
+                        break
+                    store.append_job_output(self.job_id, f"[user→agent] {next_msg}")
+                    await client.query(next_msg)
+                    await self._drain_response(client)
+            store.update_job(
+                self.job_id,
+                status="succeeded",
+                finished_at=time.time(),
+                summary="finished",
+            )
+            _notify(self.job_id, "finished cleanly")
+        except asyncio.CancelledError:
+            store.update_job(
+                self.job_id,
+                status="cancelled",
+                finished_at=time.time(),
+                summary="cancelled",
+            )
+            _notify(self.job_id, "cancelled")
+            raise
+        except Exception as e:  # noqa: BLE001
+            store.update_job(
+                self.job_id,
+                status="failed",
+                finished_at=time.time(),
+                summary=f"error: {e}",
+            )
+            _notify(self.job_id, f"failed: {e}")
+        finally:
+            _RUNNERS.pop(self.job_id, None)
+
+
+_RUNNERS: dict[str, JobRunner] = {}
 
 
 @tool(
     "dispatch_to_repo",
-    "Run a Claude Code agent inside repo_path with the given instruction. Runs in the "
-    "background; returns a job id. Optionally link to an existing task_id.",
+    "Start a background Claude Code agent inside repo_path with the given "
+    "instruction. The agent stays alive — use send_to_job to give follow-ups, "
+    "tail_job to peek at output, finish_job to end politely, or cancel_job "
+    "to hard-stop. Optionally link to an existing task_id.",
     {"repo_path": str, "instruction": str, "task_id": str},
 )
 async def dispatch_to_repo(args):
@@ -143,8 +204,9 @@ async def dispatch_to_repo(args):
         repo_path=repo,
         instruction=args["instruction"],
     )
-    bg = asyncio.create_task(_run_dispatch(job.id, repo, args["instruction"]))
-    _BG_TASKS[job.id] = bg
+    runner = JobRunner(job.id, repo, args["instruction"])
+    _RUNNERS[job.id] = runner
+    runner.start()
     if args.get("task_id"):
         try:
             store.update_task(args["task_id"], status="in_progress")
@@ -152,6 +214,42 @@ async def dispatch_to_repo(args):
         except KeyError:
             pass
     return _ok(f"started job {job.id} in {repo}")
+
+
+@tool(
+    "send_to_job",
+    "Send a follow-up instruction to a running job. The job must still be running.",
+    {"id": str, "message": str},
+)
+async def send_to_job(args):
+    runner = _RUNNERS.get(args["id"])
+    if not runner:
+        return _ok(f"no running job with id {args['id']}")
+    await runner.queue.put(args["message"])
+    return _ok(f"queued message to job {args['id']}")
+
+
+@tool(
+    "finish_job",
+    "Politely end a running job with no more instructions; it will exit cleanly "
+    "after its current turn.",
+    {"id": str},
+)
+async def finish_job(args):
+    runner = _RUNNERS.get(args["id"])
+    if not runner:
+        return _ok(f"no running job with id {args['id']}")
+    await runner.queue.put(None)
+    return _ok(f"finish signal sent to {args['id']}")
+
+
+@tool("cancel_job", "Hard-cancel a running background job by id.", {"id": str})
+async def cancel_job(args):
+    runner = _RUNNERS.get(args["id"])
+    if not runner or not runner.task:
+        return _ok(f"job {args['id']} not running")
+    runner.task.cancel()
+    return _ok(f"cancelled {args['id']}")
 
 
 @tool("list_jobs", "List dispatched background jobs (optional status filter).", {"status": str})
@@ -178,15 +276,55 @@ async def get_job(args):
     )
 
 
-@tool("cancel_job", "Cancel a running background job by id.", {"id": str})
-async def cancel_job(args):
-    jid = args["id"]
-    bg = _BG_TASKS.get(jid)
-    if not bg:
-        return _ok(f"job {jid} not running")
-    bg.cancel()
-    store.update_job(jid, status="cancelled", finished_at=time.time(), summary="cancelled by user")
-    return _ok(f"cancelled {jid}")
+@tool(
+    "tail_job",
+    "Show the last N lines of a job's output (default 30, max 200).",
+    {"id": str, "lines": int},
+)
+async def tail_job(args):
+    j = store.get_job(args["id"])
+    if not j:
+        return _ok("job not found")
+    n = max(1, min(int(args.get("lines") or 30), 200))
+    tail = "\n".join(j.output_tail[-n:]) if j.output_tail else "(no output)"
+    return _ok(tail)
+
+
+# --- GitHub PR watching --------------------------------------------------
+
+
+@tool(
+    "watch_pr",
+    "Start polling a GitHub PR for new comments, state changes, or CI failures. "
+    "Requires `gh` CLI to be installed and authenticated. interval_sec defaults to "
+    "120 and is clamped to a minimum of 30.",
+    {"repo": str, "number": int, "interval_sec": int},
+)
+async def watch_pr(args):
+    from .watcher import add_watch
+    return _ok(add_watch(args["repo"], int(args["number"]), int(args.get("interval_sec") or 120)))
+
+
+@tool("unwatch_pr", "Stop watching a PR.", {"repo": str, "number": int})
+async def unwatch_pr(args):
+    from .watcher import remove_watch
+    return _ok(remove_watch(args["repo"], int(args["number"])))
+
+
+@tool("list_watched_prs", "List PRs currently being watched.", {})
+async def list_watched_prs(args):
+    from .watcher import list_watches
+    items = list_watches()
+    if not items:
+        return _ok("(no watches)")
+    lines = []
+    for e in items:
+        last = time.strftime("%H:%M:%S", time.localtime(e.last_check)) if e.last_check else "-"
+        err = f" err={e.last_error[:40]}" if e.last_error else ""
+        lines.append(
+            f"- {e.key} every {e.interval}s | state={e.last_state or '?'} | last={last}{err}"
+        )
+    return _ok("\n".join(lines))
 
 
 def build_server():
@@ -199,9 +337,15 @@ def build_server():
             update_task,
             get_task,
             dispatch_to_repo,
+            send_to_job,
+            finish_job,
+            cancel_job,
             list_jobs,
             get_job,
-            cancel_job,
+            tail_job,
+            watch_pr,
+            unwatch_pr,
+            list_watched_prs,
         ],
     )
 
@@ -212,9 +356,15 @@ ALLOWED_TOOLS = [
     "mcp__friday__update_task",
     "mcp__friday__get_task",
     "mcp__friday__dispatch_to_repo",
+    "mcp__friday__send_to_job",
+    "mcp__friday__finish_job",
+    "mcp__friday__cancel_job",
     "mcp__friday__list_jobs",
     "mcp__friday__get_job",
-    "mcp__friday__cancel_job",
+    "mcp__friday__tail_job",
+    "mcp__friday__watch_pr",
+    "mcp__friday__unwatch_pr",
+    "mcp__friday__list_watched_prs",
     "Task",
     "Read",
     "Bash",
