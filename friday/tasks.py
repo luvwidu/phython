@@ -12,9 +12,20 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 TASKS_FILE = DATA_DIR / "tasks.json"
 JOBS_FILE = DATA_DIR / "jobs.json"
 NOTIFS_FILE = DATA_DIR / "notifications.jsonl"
+PROJECTS_FILE = DATA_DIR / "projects.json"
 
 TaskStatus = Literal["pending", "in_progress", "blocked", "done", "cancelled"]
 JobStatus = Literal["running", "succeeded", "failed", "cancelled"]
+
+
+@dataclass
+class Project:
+    name: str
+    repo_path: str = ""
+    description: str = ""
+    github_repo: str = ""  # owner/name for PR-watch convenience
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -48,6 +59,7 @@ class Store:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._tasks: dict[str, Task] = {}
         self._jobs: dict[str, Job] = {}
+        self._projects: dict[str, Project] = {}
         self._load()
 
     def _load(self) -> None:
@@ -57,6 +69,9 @@ class Store:
         if JOBS_FILE.exists():
             raw = json.loads(JOBS_FILE.read_text())
             self._jobs = {jid: Job(**j) for jid, j in raw.items()}
+        if PROJECTS_FILE.exists():
+            raw = json.loads(PROJECTS_FILE.read_text())
+            self._projects = {n: Project(**p) for n, p in raw.items()}
 
     def _save_tasks(self) -> None:
         TASKS_FILE.write_text(
@@ -67,6 +82,53 @@ class Store:
         JOBS_FILE.write_text(
             json.dumps({k: asdict(v) for k, v in self._jobs.items()}, indent=2, ensure_ascii=False)
         )
+
+    def _save_projects(self) -> None:
+        PROJECTS_FILE.write_text(
+            json.dumps({k: asdict(v) for k, v in self._projects.items()}, indent=2, ensure_ascii=False)
+        )
+
+    # --- projects ---------------------------------------------------------
+
+    def register_project(
+        self,
+        name: str,
+        repo_path: str = "",
+        description: str = "",
+        github_repo: str = "",
+    ) -> Project:
+        if name in self._projects:
+            p = self._projects[name]
+            if repo_path:
+                p.repo_path = repo_path
+            if description:
+                p.description = description
+            if github_repo:
+                p.github_repo = github_repo
+            p.updated_at = time.time()
+        else:
+            p = Project(
+                name=name,
+                repo_path=repo_path,
+                description=description,
+                github_repo=github_repo,
+            )
+            self._projects[name] = p
+        self._save_projects()
+        return p
+
+    def unregister_project(self, name: str) -> bool:
+        if name in self._projects:
+            del self._projects[name]
+            self._save_projects()
+            return True
+        return False
+
+    def get_project(self, name: str) -> Optional[Project]:
+        return self._projects.get(name)
+
+    def list_projects(self) -> list[Project]:
+        return sorted(self._projects.values(), key=lambda p: p.name)
 
     def add_task(self, title: str, description: str = "", project: str = "", owner: str = "") -> Task:
         tid = uuid.uuid4().hex[:8]

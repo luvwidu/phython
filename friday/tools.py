@@ -24,6 +24,181 @@ def _ok(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}]}
 
 
+def _resolve_repo(project_name: str = "", repo_path: str = "") -> tuple[Optional[str], str]:
+    """Return (resolved_path, error_message). Either project_name or repo_path must be set."""
+    if project_name:
+        proj = store.get_project(project_name)
+        if not proj:
+            return None, f"unknown project: {project_name}"
+        if not proj.repo_path:
+            return None, f"project '{project_name}' has no repo_path"
+        p = Path(proj.repo_path).expanduser()
+        if not p.exists():
+            return None, f"project '{project_name}' repo_path missing: {proj.repo_path}"
+        return str(p.resolve()), ""
+    if repo_path:
+        p = Path(repo_path).expanduser()
+        if not p.exists():
+            return None, f"repo path does not exist: {repo_path}"
+        return str(p.resolve()), ""
+    return None, "must provide project or repo_path"
+
+
+# --- project tools --------------------------------------------------------
+
+
+@tool(
+    "register_project",
+    "Register or update a project Friday should oversee. name is the short alias "
+    "you'll use everywhere (e.g. 'phython'). repo_path is the local checkout. "
+    "github_repo is the owner/name form for PR watching.",
+    {"name": str, "repo_path": str, "description": str, "github_repo": str},
+)
+async def register_project(args):
+    p = store.register_project(
+        name=args["name"],
+        repo_path=args.get("repo_path", ""),
+        description=args.get("description", ""),
+        github_repo=args.get("github_repo", ""),
+    )
+    return _ok(
+        f"registered '{p.name}' → {p.repo_path or '(no path)'} "
+        f"github={p.github_repo or '-'}"
+    )
+
+
+@tool("unregister_project", "Remove a project from Friday's registry.", {"name": str})
+async def unregister_project(args):
+    if store.unregister_project(args["name"]):
+        return _ok(f"unregistered {args['name']}")
+    return _ok(f"no project named {args['name']}")
+
+
+@tool("list_projects", "List all registered projects with quick counts.", {})
+async def list_projects(args):
+    projects = store.list_projects()
+    if not projects:
+        return _ok("(no projects registered)")
+    all_tasks = store.list_tasks()
+    all_jobs = store.list_jobs()
+    lines = []
+    for p in projects:
+        open_tasks = [
+            t for t in all_tasks
+            if t.project == p.name and t.status in ("pending", "in_progress", "blocked")
+        ]
+        running_jobs = [
+            j for j in all_jobs
+            if j.repo_path == p.repo_path and j.status == "running"
+        ]
+        lines.append(
+            f"- {p.name} | {p.repo_path or '(no path)'} | github={p.github_repo or '-'} "
+            f"| open_tasks={len(open_tasks)} running_jobs={len(running_jobs)}"
+        )
+    return _ok("\n".join(lines))
+
+
+@tool(
+    "get_project",
+    "Show one project's full state: description, repo, open tasks, recent jobs, watched PRs.",
+    {"name": str},
+)
+async def get_project(args):
+    name = args["name"]
+    p = store.get_project(name)
+    if not p:
+        return _ok(f"no project named {name}")
+
+    open_tasks = [
+        t for t in store.list_tasks()
+        if t.project == name and t.status in ("pending", "in_progress", "blocked")
+    ]
+    done_recent = [
+        t for t in store.list_tasks(status="done")
+        if t.project == name
+    ][:5]
+    recent_jobs = [
+        j for j in store.list_jobs() if j.repo_path == p.repo_path
+    ][:5]
+
+    from .watcher import list_watches
+    watches = [w for w in list_watches() if w.repo == p.github_repo]
+
+    parts = [
+        f"name: {p.name}",
+        f"repo_path: {p.repo_path or '(none)'}",
+        f"github_repo: {p.github_repo or '(none)'}",
+        f"description: {p.description or '(none)'}",
+        "",
+        f"open tasks ({len(open_tasks)}):",
+    ]
+    parts += [f"  - [{t.status}] {t.id} {t.title}" for t in open_tasks] or ["  (none)"]
+    parts.append(f"\nrecently done ({len(done_recent)}):")
+    parts += [f"  - {t.id} {t.title}" for t in done_recent] or ["  (none)"]
+    parts.append(f"\nrecent jobs ({len(recent_jobs)}):")
+    parts += [
+        f"  - {j.id} [{j.status}] {j.summary or j.instruction[:60]}"
+        for j in recent_jobs
+    ] or ["  (none)"]
+    parts.append(f"\nwatched PRs ({len(watches)}):")
+    parts += [
+        f"  - #{w.number} state={w.last_state or '?'}"
+        for w in watches
+    ] or ["  (none)"]
+
+    return _ok("\n".join(parts))
+
+
+@tool(
+    "overview",
+    "Cross-project dashboard: per project, show open task / running job / watched PR counts "
+    "and surface recent activity. The first thing to call when checking 'how is everything'.",
+    {},
+)
+async def overview(args):
+    projects = store.list_projects()
+    all_tasks = store.list_tasks()
+    all_jobs = store.list_jobs()
+    from .watcher import list_watches
+    watches = list_watches()
+
+    lines = ["── Friday overview ──"]
+    if not projects:
+        lines.append("(no projects registered — use register_project to add one)")
+    for p in projects:
+        open_tasks = [
+            t for t in all_tasks
+            if t.project == p.name and t.status in ("pending", "in_progress", "blocked")
+        ]
+        running_jobs = [
+            j for j in all_jobs
+            if j.repo_path == p.repo_path and j.status == "running"
+        ]
+        proj_watches = [w for w in watches if w.repo == p.github_repo]
+        in_prog_titles = [t.title for t in open_tasks if t.status == "in_progress"][:3]
+        focus = f" focus: {'; '.join(in_prog_titles)}" if in_prog_titles else ""
+        lines.append(
+            f"• {p.name}: {len(open_tasks)} open / {len(running_jobs)} running / "
+            f"{len(proj_watches)} watched{focus}"
+        )
+
+    orphan_tasks = [
+        t for t in all_tasks
+        if t.status in ("pending", "in_progress", "blocked")
+        and (not t.project or not store.get_project(t.project))
+    ]
+    if orphan_tasks:
+        lines.append(f"\nunassigned open tasks ({len(orphan_tasks)}):")
+        lines += [f"  - [{t.status}] {t.id} {t.title}" for t in orphan_tasks[:5]]
+
+    running = [j for j in all_jobs if j.status == "running"]
+    if running:
+        lines.append(f"\nrunning jobs ({len(running)}):")
+        lines += [f"  - {j.id} {j.repo_path}: {j.instruction[:60]}" for j in running[:5]]
+
+    return _ok("\n".join(lines))
+
+
 # --- task tools -----------------------------------------------------------
 
 
@@ -187,18 +362,16 @@ _RUNNERS: dict[str, JobRunner] = {}
 
 @tool(
     "dispatch_to_repo",
-    "Start a background Claude Code agent inside repo_path with the given "
-    "instruction. The agent stays alive — use send_to_job to give follow-ups, "
-    "tail_job to peek at output, finish_job to end politely, or cancel_job "
-    "to hard-stop. Optionally link to an existing task_id.",
-    {"repo_path": str, "instruction": str, "task_id": str},
+    "Start a background Claude Code agent in a project. Provide either `project` "
+    "(registered alias, preferred) or `repo_path` (raw path). The agent stays alive — "
+    "use send_to_job for follow-ups, tail_job to peek, finish_job to end politely, "
+    "cancel_job to hard-stop. Optionally link to an existing task_id.",
+    {"project": str, "repo_path": str, "instruction": str, "task_id": str},
 )
 async def dispatch_to_repo(args):
-    raw = args["repo_path"]
-    p = Path(raw).expanduser()
-    if not p.exists():
-        return _ok(f"repo path does not exist: {raw}")
-    repo = str(p.resolve())
+    repo, err = _resolve_repo(args.get("project", ""), args.get("repo_path", ""))
+    if err:
+        return _ok(err)
     job = store.add_job(
         task_id=(args.get("task_id") or None),
         repo_path=repo,
@@ -332,6 +505,11 @@ def build_server():
         name="friday",
         version="0.1.0",
         tools=[
+            register_project,
+            unregister_project,
+            list_projects,
+            get_project,
+            overview,
             add_task,
             list_tasks,
             update_task,
@@ -351,6 +529,11 @@ def build_server():
 
 
 ALLOWED_TOOLS = [
+    "mcp__friday__register_project",
+    "mcp__friday__unregister_project",
+    "mcp__friday__list_projects",
+    "mcp__friday__get_project",
+    "mcp__friday__overview",
     "mcp__friday__add_task",
     "mcp__friday__list_tasks",
     "mcp__friday__update_task",
