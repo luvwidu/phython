@@ -25,11 +25,13 @@ from .tasks import store
 from .workers import BaseWorker, WorkerResult
 from .workers.claude import ClaudeWorker
 from .workers.gemini import GeminiWorker
+from .workers.manus import ManusWorker
 
 
 WORKER_REGISTRY: dict[str, type[BaseWorker]] = {
     "claude": ClaudeWorker,
     "gemini": GeminiWorker,
+    "manus": ManusWorker,
 }
 
 _TASKS: dict[str, asyncio.Task] = {}

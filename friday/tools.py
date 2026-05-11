@@ -507,8 +507,10 @@ async def tail_job(args):
 @tool(
     "studio_run",
     "Dispatch the same instruction to multiple coding agents in parallel, each in "
-    "its own isolated git worktree. agents is a comma-separated list (default: "
-    "'claude,gemini'). Returns a run_id. Use get_studio_run / synthesize_studio_run / "
+    "its own isolated git worktree. agents is a comma-separated list — available: "
+    "'claude' (local Claude Code), 'gemini' (local Gemini CLI), 'manus' (remote "
+    "research agent, slower, requires MANUS_API_KEY). Default: 'claude,gemini'. "
+    "Returns a run_id. Use get_studio_run / synthesize_studio_run / "
     "apply_studio_result to follow up.",
     {"project": str, "instruction": str, "agents": str},
 )
