@@ -69,6 +69,26 @@ RATE_LIMIT_MSGS = 20
 RATE_LIMIT_WINDOW = 60.0  # seconds
 
 
+# Appended to the shared SYSTEM_PROMPT only when running as the Telegram bot.
+# The REPL keeps its original prompt unchanged.
+TELEGRAM_PROMPT_SUFFIX = """
+
+Chat-style interaction (Telegram):
+- You are talking to the user via Telegram. There is NO UI for structured
+  prompts — AskUserQuestion and ExitPlanMode are disabled in this context
+  and would return empty.
+- When you need clarification, ask in plain Korean (or English if the user
+  writes English) and STOP. The user's next message is their reply.
+- When a request is ambiguous, ALWAYS ask one or two short questions before
+  dispatching long-running jobs. Don't guess and run — the user can't see
+  what you're about to do until you've already done it.
+- Keep replies tight: bullets over paragraphs, no decorative section headers.
+- The user can't approve tool calls interactively. If a Bash command is
+  blocked by the safety policy, tell them so and suggest running it from the
+  local REPL instead — don't loop trying variations.
+"""
+
+
 log = logging.getLogger("friday.bot")
 
 
@@ -415,9 +435,13 @@ async def _main() -> None:
     server = build_server()
     extra_servers, extra_allowed, source = load_mcp_config()
     options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT + TELEGRAM_PROMPT_SUFFIX,
         mcp_servers={"friday": server, **extra_servers},
         allowed_tools=ALLOWED_TOOLS + extra_allowed,
+        # AskUserQuestion + ExitPlanMode return empty in headless contexts;
+        # the model would then proceed with assumptions. Force it to ask
+        # follow-ups as plain text instead.
+        disallowed_tools=["AskUserQuestion", "ExitPlanMode"],
         agents=REGISTRY,
         model="claude-opus-4-7",
         # bot has no interactive approval channel → bypass + gated by
