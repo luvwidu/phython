@@ -13,9 +13,11 @@ TASKS_FILE = DATA_DIR / "tasks.json"
 JOBS_FILE = DATA_DIR / "jobs.json"
 NOTIFS_FILE = DATA_DIR / "notifications.jsonl"
 PROJECTS_FILE = DATA_DIR / "projects.json"
+STUDIO_FILE = DATA_DIR / "studio_runs.json"
 
 TaskStatus = Literal["pending", "in_progress", "blocked", "done", "cancelled"]
 JobStatus = Literal["running", "succeeded", "failed", "cancelled"]
+StudioStatus = Literal["running", "completed", "synthesized", "failed", "cancelled"]
 
 
 @dataclass
@@ -27,6 +29,23 @@ class Project:
     host: str = ""  # which machine the local checkout lives on (e.g. mac, windows)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class StudioRun:
+    id: str
+    project: str
+    repo_path: str
+    instruction: str
+    agents: list[str]
+    status: StudioStatus = "running"
+    base_sha: str = ""
+    started_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
+    # per-agent results: {agent: {success, summary, files_changed, diff_size, error}}
+    results: dict[str, dict] = field(default_factory=dict)
+    # synthesis output (filled by Phase 4)
+    synthesis: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -62,6 +81,7 @@ class Store:
         self._tasks: dict[str, Task] = {}
         self._jobs: dict[str, Job] = {}
         self._projects: dict[str, Project] = {}
+        self._studio: dict[str, StudioRun] = {}
         self._load()
 
     def _load(self) -> None:
@@ -74,6 +94,9 @@ class Store:
         if PROJECTS_FILE.exists():
             raw = json.loads(PROJECTS_FILE.read_text())
             self._projects = {n: Project(**p) for n, p in raw.items()}
+        if STUDIO_FILE.exists():
+            raw = json.loads(STUDIO_FILE.read_text())
+            self._studio = {rid: StudioRun(**r) for rid, r in raw.items()}
 
     def _schedule_sync(self) -> None:
         try:
@@ -97,6 +120,12 @@ class Store:
     def _save_projects(self) -> None:
         PROJECTS_FILE.write_text(
             json.dumps({k: asdict(v) for k, v in self._projects.items()}, indent=2, ensure_ascii=False)
+        )
+        self._schedule_sync()
+
+    def _save_studio(self) -> None:
+        STUDIO_FILE.write_text(
+            json.dumps({k: asdict(v) for k, v in self._studio.items()}, indent=2, ensure_ascii=False)
         )
         self._schedule_sync()
 
@@ -222,6 +251,39 @@ class Store:
 
     def get_job(self, jid: str) -> Optional[Job]:
         return self._jobs.get(jid)
+
+    # --- studio runs ------------------------------------------------------
+
+    def add_studio_run(
+        self, run_id: str, project: str, repo_path: str,
+        instruction: str, agents: list[str], base_sha: str = "",
+    ) -> StudioRun:
+        run = StudioRun(
+            id=run_id, project=project, repo_path=repo_path,
+            instruction=instruction, agents=list(agents), base_sha=base_sha,
+        )
+        self._studio[run_id] = run
+        self._save_studio()
+        return run
+
+    def update_studio_run(self, run_id: str, **fields_) -> StudioRun:
+        r = self._studio[run_id]
+        for k, v in fields_.items():
+            if hasattr(r, k):
+                setattr(r, k, v)
+        self._save_studio()
+        return r
+
+    def set_studio_result(self, run_id: str, agent: str, result: dict) -> None:
+        r = self._studio[run_id]
+        r.results[agent] = result
+        self._save_studio()
+
+    def get_studio_run(self, run_id: str) -> Optional[StudioRun]:
+        return self._studio.get(run_id)
+
+    def list_studio_runs(self) -> list[StudioRun]:
+        return sorted(self._studio.values(), key=lambda r: r.started_at, reverse=True)
 
     def append_notification(self, text: str) -> None:
         try:

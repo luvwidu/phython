@@ -501,6 +501,131 @@ async def tail_job(args):
     return _ok(tail)
 
 
+# --- Studio: multi-agent ensemble runs -----------------------------------
+
+
+@tool(
+    "studio_run",
+    "Dispatch the same instruction to multiple coding agents in parallel, each in "
+    "its own isolated git worktree. agents is a comma-separated list (default: "
+    "'claude,gemini'). Returns a run_id. Use get_studio_run / synthesize_studio_run / "
+    "apply_studio_result to follow up.",
+    {"project": str, "instruction": str, "agents": str},
+)
+async def studio_run(args):
+    from . import studio
+    raw_agents = (args.get("agents") or "claude,gemini").strip()
+    agents = [a.strip() for a in raw_agents.split(",") if a.strip()]
+    run_id, msg = await studio.start_run(
+        project_name=args["project"],
+        instruction=args["instruction"],
+        agents=agents,
+    )
+    return _ok(msg)
+
+
+@tool(
+    "list_studio_runs",
+    "List recent studio runs (newest first).",
+    {},
+)
+async def list_studio_runs(args):
+    runs = store.list_studio_runs()
+    if not runs:
+        return _ok("(no studio runs yet)")
+    lines = []
+    for r in runs[:20]:
+        agents = ",".join(r.agents)
+        lines.append(
+            f"- {r.id} [{r.status}] project={r.project} agents={agents} "
+            f"task={r.instruction[:60]}"
+        )
+    return _ok("\n".join(lines))
+
+
+@tool(
+    "get_studio_run",
+    "Show one studio run: per-agent summary, file lists, diff sizes, and (if "
+    "synthesized) the chosen result.",
+    {"id": str},
+)
+async def get_studio_run(args):
+    r = store.get_studio_run(args["id"])
+    if not r:
+        return _ok("run not found")
+    lines = [
+        f"id: {r.id}",
+        f"project: {r.project}",
+        f"repo: {r.repo_path}",
+        f"status: {r.status}",
+        f"base: {r.base_sha[:10]}",
+        f"task: {r.instruction}",
+        f"agents: {', '.join(r.agents)}",
+        "",
+        "results:",
+    ]
+    for agent in r.agents:
+        res = r.results.get(agent)
+        if not res:
+            lines.append(f"  {agent}: (no result yet)")
+            continue
+        status = "✓" if res.get("success") else "✗"
+        files = res.get("files_changed", [])
+        lines.append(
+            f"  {agent}: {status} {res.get('summary','')[:80]} "
+            f"({len(files)} files, {res.get('diff_size',0)} bytes diff)"
+        )
+        for f in files[:5]:
+            lines.append(f"      - {f}")
+        if res.get("error"):
+            lines.append(f"      ! {res['error'][:120]}")
+    if r.synthesis:
+        lines.append("")
+        lines.append(f"synthesis: strategy={r.synthesis.get('strategy')} "
+                     f"chosen={r.synthesis.get('chosen')}")
+    return _ok("\n".join(lines))
+
+
+@tool(
+    "synthesize_studio_run",
+    "Have Friday compare the agents' diffs and decide. strategy='pick_best' (default) "
+    "picks one diff as the winner; 'merge' produces an integrated diff combining "
+    "strengths of each. Run must be in 'completed' status.",
+    {"id": str, "strategy": str},
+)
+async def synthesize_studio_run(args):
+    from . import studio
+    strategy = args.get("strategy") or "pick_best"
+    if strategy not in {"pick_best", "merge"}:
+        return _ok(f"unknown strategy: {strategy} (use pick_best or merge)")
+    ok, msg = await studio.synthesize(args["id"], strategy)
+    return _ok(msg)
+
+
+@tool(
+    "apply_studio_result",
+    "Apply the synthesized diff onto a new branch in the project repo. The branch "
+    "is created from the same base commit the run forked from. Changes are left "
+    "uncommitted so the user can review before committing.",
+    {"id": str, "branch_name": str},
+)
+async def apply_studio_result(args):
+    from . import studio
+    ok, msg = await studio.apply_result(args["id"], args["branch_name"])
+    return _ok(msg)
+
+
+@tool(
+    "cancel_studio_run",
+    "Cancel a running studio run. Worktrees for that run are NOT auto-cleaned — "
+    "use get_studio_run to inspect, then they get reused on next run.",
+    {"id": str},
+)
+async def cancel_studio_run(args):
+    from . import studio
+    return _ok(studio.cancel_run(args["id"]))
+
+
 # --- GitHub PR watching --------------------------------------------------
 
 
@@ -562,6 +687,12 @@ def build_server():
             watch_pr,
             unwatch_pr,
             list_watched_prs,
+            studio_run,
+            list_studio_runs,
+            get_studio_run,
+            synthesize_studio_run,
+            apply_studio_result,
+            cancel_studio_run,
         ],
     )
 
@@ -586,6 +717,12 @@ ALLOWED_TOOLS = [
     "mcp__friday__watch_pr",
     "mcp__friday__unwatch_pr",
     "mcp__friday__list_watched_prs",
+    "mcp__friday__studio_run",
+    "mcp__friday__list_studio_runs",
+    "mcp__friday__get_studio_run",
+    "mcp__friday__synthesize_studio_run",
+    "mcp__friday__apply_studio_result",
+    "mcp__friday__cancel_studio_run",
     "Task",
     "Read",
     "Bash",
