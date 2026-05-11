@@ -18,8 +18,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
+from collections import defaultdict, deque
 from typing import Optional
 
 try:
@@ -38,6 +40,7 @@ from claude_agent_sdk import (
     ThinkingBlock,
     ToolUseBlock,
 )
+from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -61,8 +64,106 @@ MAX_MESSAGE_LEN = 3900  # Telegram hard limit is 4096; leave headroom
 TYPING_REFRESH_SEC = 4
 NOTIFICATIONS_POLL_SEC = 5
 
+# Rate limit: per-user sliding window
+RATE_LIMIT_MSGS = 20
+RATE_LIMIT_WINDOW = 60.0  # seconds
+
 
 log = logging.getLogger("friday.bot")
+
+
+# --- safety: dangerous Bash command patterns ------------------------------
+#
+# These run as a deny-list on every Bash tool invocation. Designed to block
+# the most catastrophic actions (filesystem wipe, privilege escalation, raw
+# disk writes, pipe-to-shell, exfiltration of credentials). False positives
+# are preferred over false negatives — if a legit command is blocked, run it
+# from the local REPL where the user can review it interactively.
+
+_DANGEROUS_BASH: list[tuple[str, str]] = [
+    (r"\bsudo\b", "sudo invocation"),
+    (r"\bsu\s+-", "su elevation"),
+    (
+        r"\brm\s+[^|;&\n]*(-[a-zA-Z]*[rR][a-zA-Z]*[fF]|-[a-zA-Z]*[fF][a-zA-Z]*[rR])\b",
+        "rm with recursive+force flags",
+    ),
+    (r"\bmkfs\b", "filesystem format"),
+    (r"\bdd\b[^|;&\n]*\bof=/dev/", "raw disk write via dd"),
+    (r">\s*/dev/(sd[a-z]|nvme\w*|disk\w*)", "redirect to raw disk"),
+    (r"\b(shutdown|reboot|halt|poweroff)\b", "system power command"),
+    (
+        r"(curl|wget|fetch)\s+[^|;\n]*\|\s*(bash|sh|zsh|fish|python|python3|node)\b",
+        "pipe download into interpreter",
+    ),
+    (r"\bchmod\s+(-R\s+)?[0-7]?777\b", "world-writable chmod"),
+    (r"\bchown\s+(-R\s+)?root\b", "chown to root"),
+    (r":\(\)\s*\{\s*:\s*\|\s*:&\s*\};:", "fork bomb"),
+    # credential exfil
+    (r"\bcat\b[^|;&\n]*\.env(\s|$|;|&|\||>)", "read .env file"),
+    (
+        r"\b(cat|less|more|head|tail)\b[^|;&\n]*id_(rsa|ed25519|ecdsa|dsa)\b",
+        "read SSH private key",
+    ),
+    (
+        r"\b(cat|less|more|head|tail)\b[^|;&\n]*\.aws/credentials",
+        "read AWS credentials",
+    ),
+]
+_DANGEROUS_BASH_COMPILED = [(re.compile(p), reason) for p, reason in _DANGEROUS_BASH]
+
+
+def _check_bash_command(cmd: str) -> Optional[str]:
+    """Return the reason a Bash command is blocked, or None if allowed."""
+    for pattern, reason in _DANGEROUS_BASH_COMPILED:
+        if pattern.search(cmd):
+            return reason
+    return None
+
+
+async def _can_use_tool(
+    tool_name: str,
+    tool_input: dict,
+    context,
+) -> PermissionResultAllow | PermissionResultDeny:
+    """Gatekeeper called by the SDK before every tool invocation."""
+    if tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        reason = _check_bash_command(cmd)
+        if reason:
+            log.warning(
+                f"BLOCKED Bash command (reason: {reason}): {cmd[:200]}"
+            )
+            return PermissionResultDeny(
+                message=(
+                    f"Bot safety policy denied this command ({reason}). "
+                    "If it is legitimate, run it from the local REPL where "
+                    "you can confirm interactively."
+                ),
+                interrupt=False,
+            )
+    return PermissionResultAllow()
+
+
+# --- rate limiting --------------------------------------------------------
+
+_rate_buckets: dict[int, deque] = defaultdict(deque)
+
+
+def _rate_limit_check(user_id: int) -> tuple[bool, float]:
+    """Sliding-window per-user rate limit.
+
+    Returns (allowed, retry_in_seconds). On allow, the current timestamp is
+    recorded in the user's bucket.
+    """
+    now = time.time()
+    bucket = _rate_buckets[user_id]
+    while bucket and now - bucket[0] > RATE_LIMIT_WINDOW:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT_MSGS:
+        retry_in = RATE_LIMIT_WINDOW - (now - bucket[0])
+        return False, retry_in
+    bucket.append(now)
+    return True, 0.0
 
 
 class BotState:
@@ -207,6 +308,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not text.strip():
         return
 
+    allowed, retry_in = _rate_limit_check(user.id)
+    if not allowed:
+        await update.message.reply_text(
+            f"⏱ 분당 메시지 제한 초과 ({RATE_LIMIT_MSGS}/{int(RATE_LIMIT_WINDOW)}s). "
+            f"{int(retry_in) + 1}초 후 다시 시도해주세요."
+        )
+        return
+
     log.info(f"[{user.id}] → {text[:120]}")
 
     if state.client is None:
@@ -311,7 +420,10 @@ async def _main() -> None:
         allowed_tools=ALLOWED_TOOLS + extra_allowed,
         agents=REGISTRY,
         model="claude-opus-4-7",
-        permission_mode="default",
+        # bot has no interactive approval channel → bypass + gated by
+        # can_use_tool. The callback blocks dangerous Bash patterns.
+        permission_mode="bypassPermissions",
+        can_use_tool=_can_use_tool,
         setting_sources=["user"],
     )
 

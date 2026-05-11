@@ -95,10 +95,39 @@ launchctl load -w ~/Library/LaunchAgents/com.사장님.friday-bot.plist
 
 ## 7. 보안 노트
 
-- 화이트리스트(`FRIDAY_TELEGRAM_ALLOWED_IDS`)에 없는 user_id 의 텍스트 메시지는
-  조용히 무시 (로그만 남김). 단 `/id` 는 누구나 호출 가능 (자기 ID 확인용).
-- 봇 토큰이 유출되면 즉시 BotFather `/revoke` 로 회수.
-- 모든 메시지가 Anthropic API 로 전송됨 — 민감 정보는 절대 직접 입력 금지.
+봇은 다음 가드레일을 코드 레벨에서 강제합니다:
+
+- **화이트리스트** — `FRIDAY_TELEGRAM_ALLOWED_IDS` 에 없는 user_id 의 텍스트
+  메시지는 조용히 무시 (로그만 남김). `/id` 는 예외(자기 ID 확인용).
+- **Rate limit** — 사용자당 60초당 최대 20 메시지. 초과 시 대기 안내.
+  (`bot.py` 상단의 `RATE_LIMIT_MSGS` / `RATE_LIMIT_WINDOW` 조정 가능)
+- **위험 명령 차단** — Bash 호출 시 `can_use_tool` 콜백이 다음 패턴을 deny:
+  `sudo`, `su -`, `rm -rf` (대소문자 무관), `mkfs`, `dd of=/dev/...`,
+  `>/dev/sda` 류, `shutdown`/`reboot`/`halt`/`poweroff`,
+  `curl|sh` 류 파이프-실행, `chmod 777`, `chown root`, 포크 폭탄,
+  `.env` / SSH 키 / AWS 자격증명 읽기. 정당한 작업이 막히면 로컬 REPL에서
+  실행할 것.
+- **`permission_mode="bypassPermissions"` + `can_use_tool` 게이트** — 봇은
+  대화형 승인 채널이 없으므로 콜백이 유일한 정책 지점. 콜백을 통과한 도구만
+  실행됨.
+
+추가로 사용자가 해야 하는 것:
+
+- **텔레그램 2FA 켜기** — Settings → Privacy → Two-Step Verification.
+  계정 탈취 = 봇 권한 탈취이므로 필수.
+- **Anthropic 콘솔에서 월 spend limit 설정** — 만에 하나 봇이 폭주해도
+  요금 폭탄 방어선.
+- **`.env` 파일 권한** — `chmod 600 ~/phython/.env` 로 본인만 읽도록.
+- **봇 토큰 유출 시** — BotFather에서 `/revoke` 로 즉시 회수, 새 토큰 발급.
+- **민감 정보 직접 입력 금지** — 모든 메시지는 Anthropic API로 전송됨.
+
+알려진 한계:
+
+- `dispatch_to_repo` 로 띄운 서브 에이전트는 `can_use_tool` 을 상속하지 않음.
+  서브 에이전트는 해당 repo 컨텍스트에서 `permission_mode="acceptEdits"` 로
+  동작하므로 파일 편집은 자동 승인, Bash는 별도 정책에 따름.
+- 정규식 기반 차단은 우회 시도에 약함 (`s​udo` 같은 zero-width 삽입 등).
+  완벽한 방어가 아니라 실수 방지용. 화이트리스트가 1차 방어선.
 
 ## 8. 동작 방식
 
