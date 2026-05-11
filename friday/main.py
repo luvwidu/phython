@@ -28,6 +28,10 @@ from claude_agent_sdk import (
     ThinkingBlock,
     ToolUseBlock,
 )
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.text import Text
 
 from .agents import REGISTRY
 from .config import load_mcp_config
@@ -38,30 +42,56 @@ from .tools import ALLOWED_TOOLS, build_server
 from .watcher import resume_all as resume_watchers
 
 
+console = Console()
+
+
 def _surface_notifications() -> None:
     notifs = store.pop_notifications()
     if not notifs:
         return
-    print()
-    print("─── 알림 ───")
-    for n in notifs:
+    body = Text()
+    for i, n in enumerate(notifs):
         ts = time.strftime("%H:%M:%S", time.localtime(n.get("ts", time.time())))
-        print(f"[{ts}] {n.get('text', '')}")
-    print("────────────")
+        body.append(f"[{ts}] ", style="dim")
+        body.append(n.get("text", ""), style="yellow")
+        if i < len(notifs) - 1:
+            body.append("\n")
+    console.print()
+    console.print(Panel(body, title="알림", title_align="left", border_style="yellow"))
+
+
+def _render_assistant_text(text: str) -> None:
+    """Render assistant text. Use markdown when it looks like markdown, else plain."""
+    has_md = any(marker in text for marker in ("```", "**", "##", "- ", "| ", "* "))
+    try:
+        if has_md:
+            console.print(Markdown(text))
+        else:
+            console.print(text)
+    except Exception:
+        console.print(text)
 
 
 def _render(msg) -> None:
     if isinstance(msg, AssistantMessage):
         for block in msg.content:
             if isinstance(block, TextBlock):
-                print(block.text)
+                _render_assistant_text(block.text)
             elif isinstance(block, ToolUseBlock):
-                print(f"  · using {block.name}")
+                console.print(f"  · {block.name}", style="dim cyan")
             elif isinstance(block, ThinkingBlock):
                 pass
     elif isinstance(msg, ResultMessage):
         if msg.is_error:
-            print(f"[error] {msg.result}")
+            console.print(f"[error] {msg.result}", style="bold red")
+
+
+def _print_banner() -> None:
+    console.print()
+    console.print(
+        "[bold]Friday[/bold] — central orchestrator. "
+        "Type a request, or 'exit' to quit.",
+    )
 
 
 async def repl() -> None:
@@ -77,27 +107,33 @@ async def repl() -> None:
         setting_sources=["user"],
     )
 
-    print("Friday — central orchestrator. Type a request, or 'exit' to quit.")
+    _print_banner()
     sync_status = sync.init()
-    print(f"  {sync_status}")
+    console.print(f"  {sync_status}", style="dim")
     if source:
-        print(f"  loaded {len(extra_servers)} external MCP server(s) from {source}")
+        console.print(
+            f"  loaded {len(extra_servers)} external MCP server(s) from {source}",
+            style="dim",
+        )
     resume_watchers()
-    sync.schedule_sync()  # kick the worker so any startup changes get pushed
+    sync.schedule_sync()
     async with ClaudeSDKClient(options=options) as client:
         while True:
             _surface_notifications()
             try:
-                user_input = (await asyncio.to_thread(input, "\nyou> ")).strip()
+                console.print()
+                # rich-styled prompt printed inline; input() then receives keystrokes
+                console.print("[bold cyan]you[/bold cyan][bold]>[/bold] ", end="")
+                user_input = (await asyncio.to_thread(input, "")).strip()
             except (EOFError, KeyboardInterrupt):
-                print()
+                console.print()
                 return
             if not user_input:
                 continue
             if user_input.lower() in {"exit", "quit", ":q"}:
                 return
             await client.query(user_input)
-            print()
+            console.print()
             async for msg in client.receive_response():
                 _render(msg)
 

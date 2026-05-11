@@ -284,32 +284,88 @@ def _extract_fenced_diff(text: str) -> str:
     return "\n".join(out).strip()
 
 
-async def apply_result(run_id: str, branch_name: str) -> tuple[bool, str]:
-    """Apply the synthesized diff to a new branch in the project repo."""
+async def apply_result(
+    run_id: str, branch_name: str, auto_cleanup: bool = True,
+) -> tuple[bool, str]:
+    """Apply the synthesized diff to a new branch in the project repo.
+
+    For pick_best strategy, we bypass `git apply` entirely — we just check out
+    the chosen agent's worktree branch's files into the new branch. That sidesteps
+    every patch-format edge case (new files, binary, CRLF, missing trailing newline).
+
+    For merge strategy, we write the synthesized diff to a temp file and try
+    `git apply` with progressively-looser flags.
+    """
     run = store.get_studio_run(run_id)
     if not run:
         return False, f"no run {run_id}"
-    diff = (run.synthesis or {}).get("final_diff")
-    if not diff:
-        return False, "no synthesized diff — call synthesize() first"
+    synth = run.synthesis or {}
+    if not synth.get("final_diff"):
+        return False, "no synthesized diff — call synthesize_studio_run first"
     repo = Path(run.repo_path)
 
-    # Create the branch from the base sha used during the run
+    # Create the new branch from the run's base.
     code, out = await worktree._run(
-        ["git", "checkout", "-b", branch_name, run.base_sha], repo,
+        ["git", "checkout", "-B", branch_name, run.base_sha], repo,
     )
-    if code != 0 and "already exists" not in out:
-        return False, f"git checkout failed: {out}"
+    if code != 0:
+        return False, f"git checkout failed: {out[:300]}"
 
-    # Apply the diff
-    proc = await asyncio.create_subprocess_exec(
-        "git", "apply", "--3way", "-",
-        cwd=str(repo),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate(diff.encode("utf-8"))
-    if proc.returncode != 0:
-        return False, f"git apply failed: {stderr.decode('utf-8', 'replace')[:300]}"
-    return True, f"applied to branch {branch_name} (uncommitted)"
+    chosen = synth.get("chosen")
+    strategy = synth.get("strategy", "pick_best")
+
+    if strategy == "pick_best" and chosen and chosen in run.results:
+        # Copy files from the agent's worktree branch.
+        agent_branch = f"friday/{run_id}/{chosen}"
+        files = run.results[chosen].get("files_changed", [])
+        if not files:
+            return False, f"{chosen} has no changed files to copy"
+        code, out = await worktree._run(
+            ["git", "checkout", agent_branch, "--"] + files, repo,
+        )
+        if code != 0:
+            return False, f"could not checkout {chosen}'s files: {out[:300]}"
+        msg = f"applied {chosen}'s changes ({len(files)} files) to {branch_name}, uncommitted"
+    else:
+        # merge strategy — apply the synthesized diff via a temp file.
+        diff = synth["final_diff"]
+        if not diff.endswith("\n"):
+            diff = diff + "\n"
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".patch", delete=False, encoding="utf-8",
+        ) as f:
+            f.write(diff)
+            patch_path = f.name
+        try:
+            for flags in (["--index"], [], ["--3way"]):
+                code, out = await worktree._run(
+                    ["git", "apply", *flags, patch_path], repo,
+                )
+                if code == 0:
+                    msg = f"applied synthesized diff to {branch_name} via `git apply {' '.join(flags)}`"
+                    break
+            else:
+                return False, f"git apply failed under all strategies; last error: {out[:300]}"
+        finally:
+            Path(patch_path).unlink(missing_ok=True)
+
+    if auto_cleanup:
+        await cleanup_run_artifacts(run_id)
+        msg += " (worktrees cleaned up)"
+    return True, msg
+
+
+async def cleanup_run_artifacts(run_id: str, delete_branches: bool = True) -> str:
+    """Remove the run's worktrees and (optionally) the friday/* branches."""
+    run = store.get_studio_run(run_id)
+    if not run:
+        return f"no run {run_id}"
+    await worktree.cleanup_run(run_id)
+    if delete_branches:
+        repo = Path(run.repo_path)
+        for agent in run.agents:
+            await worktree._run(
+                ["git", "branch", "-D", f"friday/{run_id}/{agent}"], repo,
+            )
+    return f"cleaned up worktrees for {run_id}"

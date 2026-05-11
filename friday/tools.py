@@ -606,12 +606,30 @@ async def synthesize_studio_run(args):
     "apply_studio_result",
     "Apply the synthesized diff onto a new branch in the project repo. The branch "
     "is created from the same base commit the run forked from. Changes are left "
-    "uncommitted so the user can review before committing.",
-    {"id": str, "branch_name": str},
+    "uncommitted so the user can review before committing. Worktrees and the "
+    "friday/<run>/<agent> branches are auto-cleaned on success unless "
+    "auto_cleanup=false.",
+    {"id": str, "branch_name": str, "auto_cleanup": bool},
 )
 async def apply_studio_result(args):
     from . import studio
-    ok, msg = await studio.apply_result(args["id"], args["branch_name"])
+    auto = args.get("auto_cleanup")
+    if auto is None:
+        auto = True
+    ok, msg = await studio.apply_result(args["id"], args["branch_name"], bool(auto))
+    return _ok(msg)
+
+
+@tool(
+    "cleanup_studio_run",
+    "Remove the run's worktrees under ~/.friday/worktrees/<id>/ and delete the "
+    "associated friday/<id>/<agent> branches in the project repo. Call this if "
+    "you applied a result manually or want to reclaim disk + branch list.",
+    {"id": str},
+)
+async def cleanup_studio_run(args):
+    from . import studio
+    msg = await studio.cleanup_run_artifacts(args["id"])
     return _ok(msg)
 
 
@@ -692,6 +710,7 @@ def build_server():
             get_studio_run,
             synthesize_studio_run,
             apply_studio_result,
+            cleanup_studio_run,
             cancel_studio_run,
         ],
     )
@@ -722,6 +741,7 @@ ALLOWED_TOOLS = [
     "mcp__friday__get_studio_run",
     "mcp__friday__synthesize_studio_run",
     "mcp__friday__apply_studio_result",
+    "mcp__friday__cleanup_studio_run",
     "mcp__friday__cancel_studio_run",
     "Task",
     "Read",
