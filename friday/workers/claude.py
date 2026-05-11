@@ -28,7 +28,7 @@ class ClaudeWorker(BaseWorker):
         tail: list[str] = []
         opts = ClaudeAgentOptions(
             cwd=self.worktree_path,
-            permission_mode="acceptEdits",
+            permission_mode="bypassPermissions",
             setting_sources=["project", "user"],
         )
         try:
