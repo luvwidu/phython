@@ -24,6 +24,7 @@ class Project:
     repo_path: str = ""
     description: str = ""
     github_repo: str = ""  # owner/name for PR-watch convenience
+    host: str = ""  # which machine the local checkout lives on (e.g. mac, windows)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -48,6 +49,7 @@ class Job:
     repo_path: str
     instruction: str
     status: JobStatus = "running"
+    host: str = ""  # which machine actually runs the ClaudeSDKClient
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
     summary: str = ""
@@ -73,20 +75,30 @@ class Store:
             raw = json.loads(PROJECTS_FILE.read_text())
             self._projects = {n: Project(**p) for n, p in raw.items()}
 
+    def _schedule_sync(self) -> None:
+        try:
+            from . import sync  # local import to avoid cycle
+            sync.schedule_sync()
+        except Exception:
+            pass
+
     def _save_tasks(self) -> None:
         TASKS_FILE.write_text(
             json.dumps({k: asdict(v) for k, v in self._tasks.items()}, indent=2, ensure_ascii=False)
         )
+        self._schedule_sync()
 
     def _save_jobs(self) -> None:
         JOBS_FILE.write_text(
             json.dumps({k: asdict(v) for k, v in self._jobs.items()}, indent=2, ensure_ascii=False)
         )
+        self._schedule_sync()
 
     def _save_projects(self) -> None:
         PROJECTS_FILE.write_text(
             json.dumps({k: asdict(v) for k, v in self._projects.items()}, indent=2, ensure_ascii=False)
         )
+        self._schedule_sync()
 
     # --- projects ---------------------------------------------------------
 
@@ -96,6 +108,7 @@ class Store:
         repo_path: str = "",
         description: str = "",
         github_repo: str = "",
+        host: str = "",
     ) -> Project:
         if name in self._projects:
             p = self._projects[name]
@@ -105,6 +118,8 @@ class Store:
                 p.description = description
             if github_repo:
                 p.github_repo = github_repo
+            if host:
+                p.host = host
             p.updated_at = time.time()
         else:
             p = Project(
@@ -112,6 +127,7 @@ class Store:
                 repo_path=repo_path,
                 description=description,
                 github_repo=github_repo,
+                host=host,
             )
             self._projects[name] = p
         self._save_projects()
@@ -166,9 +182,18 @@ class Store:
     def get_task(self, tid: str) -> Optional[Task]:
         return self._tasks.get(tid)
 
-    def add_job(self, task_id: Optional[str], repo_path: str, instruction: str) -> Job:
+    def add_job(
+        self,
+        task_id: Optional[str],
+        repo_path: str,
+        instruction: str,
+        host: str = "",
+    ) -> Job:
         jid = uuid.uuid4().hex[:8]
-        job = Job(id=jid, task_id=task_id, repo_path=repo_path, instruction=instruction)
+        job = Job(
+            id=jid, task_id=task_id, repo_path=repo_path,
+            instruction=instruction, host=host,
+        )
         self._jobs[jid] = job
         self._save_jobs()
         return job
@@ -199,9 +224,16 @@ class Store:
         return self._jobs.get(jid)
 
     def append_notification(self, text: str) -> None:
-        line = json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False)
+        try:
+            from . import sync
+            host = sync.machine() if sync.is_enabled() else ""
+        except Exception:
+            host = ""
+        tagged = f"[{host}] {text}" if host else text
+        line = json.dumps({"ts": time.time(), "text": tagged}, ensure_ascii=False)
         with NOTIFS_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+        self._schedule_sync()
 
     def pop_notifications(self) -> list[dict]:
         if not NOTIFS_FILE.exists():

@@ -32,6 +32,7 @@ from claude_agent_sdk import (
 from .agents import REGISTRY
 from .config import load_mcp_config
 from .prompts import SYSTEM_PROMPT
+from . import sync
 from .tasks import store
 from .tools import ALLOWED_TOOLS, build_server
 from .watcher import resume_all as resume_watchers
@@ -77,9 +78,12 @@ async def repl() -> None:
     )
 
     print("Friday — central orchestrator. Type a request, or 'exit' to quit.")
+    sync_status = sync.init()
+    print(f"  {sync_status}")
     if source:
         print(f"  loaded {len(extra_servers)} external MCP server(s) from {source}")
     resume_watchers()
+    sync.schedule_sync()  # kick the worker so any startup changes get pushed
     async with ClaudeSDKClient(options=options) as client:
         while True:
             _surface_notifications()

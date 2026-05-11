@@ -50,20 +50,24 @@ def _resolve_repo(project_name: str = "", repo_path: str = "") -> tuple[Optional
 @tool(
     "register_project",
     "Register or update a project Friday should oversee. name is the short alias "
-    "you'll use everywhere (e.g. 'phython'). repo_path is the local checkout. "
-    "github_repo is the owner/name form for PR watching.",
-    {"name": str, "repo_path": str, "description": str, "github_repo": str},
+    "you'll use everywhere (e.g. 'phython'). repo_path is the local checkout on "
+    "THIS machine. github_repo is the owner/name form for PR watching. host is the "
+    "machine alias where the repo lives (e.g. mac, windows) — defaults to current.",
+    {"name": str, "repo_path": str, "description": str, "github_repo": str, "host": str},
 )
 async def register_project(args):
+    from . import sync
+    host = args.get("host") or (sync.machine() if sync.is_enabled() else "")
     p = store.register_project(
         name=args["name"],
         repo_path=args.get("repo_path", ""),
         description=args.get("description", ""),
         github_repo=args.get("github_repo", ""),
+        host=host,
     )
     return _ok(
         f"registered '{p.name}' → {p.repo_path or '(no path)'} "
-        f"github={p.github_repo or '-'}"
+        f"host={p.host or '-'} github={p.github_repo or '-'}"
     )
 
 
@@ -92,8 +96,9 @@ async def list_projects(args):
             if j.repo_path == p.repo_path and j.status == "running"
         ]
         lines.append(
-            f"- {p.name} | {p.repo_path or '(no path)'} | github={p.github_repo or '-'} "
-            f"| open_tasks={len(open_tasks)} running_jobs={len(running_jobs)}"
+            f"- {p.name} | host={p.host or '-'} | {p.repo_path or '(no path)'} | "
+            f"github={p.github_repo or '-'} | open_tasks={len(open_tasks)} "
+            f"running_jobs={len(running_jobs)}"
         )
     return _ok("\n".join(lines))
 
@@ -151,36 +156,50 @@ async def get_project(args):
 
 @tool(
     "overview",
-    "Cross-project dashboard: per project, show open task / running job / watched PR counts "
-    "and surface recent activity. The first thing to call when checking 'how is everything'.",
+    "Cross-project dashboard grouped by host machine: per project, show open task / "
+    "running job / watched PR counts and surface recent activity. The first thing to "
+    "call when checking 'how is everything'.",
     {},
 )
 async def overview(args):
+    from . import sync
     projects = store.list_projects()
     all_tasks = store.list_tasks()
     all_jobs = store.list_jobs()
     from .watcher import list_watches
     watches = list_watches()
 
-    lines = ["── Friday overview ──"]
+    current = sync.machine() if sync.is_enabled() else ""
+    header = "── Friday overview ──"
+    if current:
+        header += f"  (this machine: {current})"
+    lines = [header]
     if not projects:
         lines.append("(no projects registered — use register_project to add one)")
+
+    by_host: dict[str, list] = {}
     for p in projects:
-        open_tasks = [
-            t for t in all_tasks
-            if t.project == p.name and t.status in ("pending", "in_progress", "blocked")
-        ]
-        running_jobs = [
-            j for j in all_jobs
-            if j.repo_path == p.repo_path and j.status == "running"
-        ]
-        proj_watches = [w for w in watches if w.repo == p.github_repo]
-        in_prog_titles = [t.title for t in open_tasks if t.status == "in_progress"][:3]
-        focus = f" focus: {'; '.join(in_prog_titles)}" if in_prog_titles else ""
-        lines.append(
-            f"• {p.name}: {len(open_tasks)} open / {len(running_jobs)} running / "
-            f"{len(proj_watches)} watched{focus}"
-        )
+        by_host.setdefault(p.host or "(unspecified)", []).append(p)
+
+    for host_name in sorted(by_host):
+        marker = " ←current" if host_name == current else ""
+        lines.append(f"\n[host: {host_name}]{marker}")
+        for p in by_host[host_name]:
+            open_tasks = [
+                t for t in all_tasks
+                if t.project == p.name and t.status in ("pending", "in_progress", "blocked")
+            ]
+            running_jobs = [
+                j for j in all_jobs
+                if j.repo_path == p.repo_path and j.status == "running"
+            ]
+            proj_watches = [w for w in watches if w.repo == p.github_repo]
+            in_prog = [t.title for t in open_tasks if t.status == "in_progress"][:3]
+            focus = f" focus: {'; '.join(in_prog)}" if in_prog else ""
+            lines.append(
+                f"  • {p.name}: {len(open_tasks)} open / {len(running_jobs)} running / "
+                f"{len(proj_watches)} watched{focus}"
+            )
 
     orphan_tasks = [
         t for t in all_tasks
@@ -194,7 +213,9 @@ async def overview(args):
     running = [j for j in all_jobs if j.status == "running"]
     if running:
         lines.append(f"\nrunning jobs ({len(running)}):")
-        lines += [f"  - {j.id} {j.repo_path}: {j.instruction[:60]}" for j in running[:5]]
+        for j in running[:5]:
+            tag = f"[{j.host}] " if j.host else ""
+            lines.append(f"  - {tag}{j.id} {j.repo_path}: {j.instruction[:60]}")
 
     return _ok("\n".join(lines))
 
@@ -369,13 +390,16 @@ _RUNNERS: dict[str, JobRunner] = {}
     {"project": str, "repo_path": str, "instruction": str, "task_id": str},
 )
 async def dispatch_to_repo(args):
+    from . import sync
     repo, err = _resolve_repo(args.get("project", ""), args.get("repo_path", ""))
     if err:
         return _ok(err)
+    host = sync.machine() if sync.is_enabled() else ""
     job = store.add_job(
         task_id=(args.get("task_id") or None),
         repo_path=repo,
         instruction=args["instruction"],
+        host=host,
     )
     runner = JobRunner(job.id, repo, args["instruction"])
     _RUNNERS[job.id] = runner
@@ -389,15 +413,29 @@ async def dispatch_to_repo(args):
     return _ok(f"started job {job.id} in {repo}")
 
 
+def _job_not_local_msg(jid: str) -> Optional[str]:
+    """Return a helpful message if the job lives on another machine, else None."""
+    from . import sync
+    j = store.get_job(jid)
+    if not j:
+        return f"no job with id {jid}"
+    if sync.is_enabled() and j.host and j.host != sync.machine():
+        return (
+            f"job {jid} runs on '{j.host}', not this machine ('{sync.machine()}'); "
+            f"switch to that machine to control it"
+        )
+    return None
+
+
 @tool(
     "send_to_job",
-    "Send a follow-up instruction to a running job. The job must still be running.",
+    "Send a follow-up instruction to a running job. The job must be running on this machine.",
     {"id": str, "message": str},
 )
 async def send_to_job(args):
     runner = _RUNNERS.get(args["id"])
     if not runner:
-        return _ok(f"no running job with id {args['id']}")
+        return _ok(_job_not_local_msg(args["id"]) or f"no running job with id {args['id']}")
     await runner.queue.put(args["message"])
     return _ok(f"queued message to job {args['id']}")
 
@@ -411,7 +449,7 @@ async def send_to_job(args):
 async def finish_job(args):
     runner = _RUNNERS.get(args["id"])
     if not runner:
-        return _ok(f"no running job with id {args['id']}")
+        return _ok(_job_not_local_msg(args["id"]) or f"no running job with id {args['id']}")
     await runner.queue.put(None)
     return _ok(f"finish signal sent to {args['id']}")
 
@@ -420,7 +458,7 @@ async def finish_job(args):
 async def cancel_job(args):
     runner = _RUNNERS.get(args["id"])
     if not runner or not runner.task:
-        return _ok(f"job {args['id']} not running")
+        return _ok(_job_not_local_msg(args["id"]) or f"job {args['id']} not running")
     runner.task.cancel()
     return _ok(f"cancelled {args['id']}")
 
