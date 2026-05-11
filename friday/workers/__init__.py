@@ -32,9 +32,19 @@ class BaseWorker(abc.ABC):
 
     agent_name: str = "base"
 
-    def __init__(self, worktree_path: str, base_ref: str = "HEAD") -> None:
+    def __init__(
+        self,
+        worktree_path: str,
+        base_ref: str = "HEAD",
+        message_queue: Optional["asyncio.Queue[Optional[str]]"] = None,
+    ) -> None:
         self.worktree_path = worktree_path
         self.base_ref = base_ref
+        # When provided, the worker stays alive after its first turn and waits
+        # on the queue for follow-up instructions. `None` on the queue signals
+        # "finish cleanly". Workers that don't support mid-flight steering may
+        # accept the queue but ignore it.
+        self.message_queue = message_queue
 
     @abc.abstractmethod
     async def run(self, instruction: str) -> WorkerResult:

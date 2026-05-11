@@ -24,6 +24,14 @@ def _msg_to_text(msg) -> str:
 class ClaudeWorker(BaseWorker):
     agent_name = "claude"
 
+    async def _drain(self, client: ClaudeSDKClient, tail: list[str]) -> None:
+        async for msg in client.receive_response():
+            text = _msg_to_text(msg)
+            if text:
+                tail.append(text)
+                if len(tail) > 120:
+                    del tail[:-120]
+
     async def run(self, instruction: str) -> WorkerResult:
         tail: list[str] = []
         opts = ClaudeAgentOptions(
@@ -34,12 +42,15 @@ class ClaudeWorker(BaseWorker):
         try:
             async with ClaudeSDKClient(options=opts) as client:
                 await client.query(instruction)
-                async for msg in client.receive_response():
-                    text = _msg_to_text(msg)
-                    if text:
-                        tail.append(text)
-                        if len(tail) > 80:
-                            tail = tail[-80:]
+                await self._drain(client, tail)
+                # mid-flight steering: stay alive while a queue is provided
+                while self.message_queue is not None:
+                    msg = await self.message_queue.get()
+                    if msg is None:
+                        break  # "finish cleanly" signal
+                    tail.append(f"[user→agent] {msg}")
+                    await client.query(msg)
+                    await self._drain(client, tail)
             await self.commit_changes(f"[claude] {instruction[:60]}")
             diff, files = await self.collect_diff()
             summary = tail[-1][:200] if tail else "(no output)"

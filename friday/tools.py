@@ -508,19 +508,52 @@ async def tail_job(args):
     "studio_run",
     "Dispatch the same instruction to multiple coding agents in parallel, each in "
     "its own isolated git worktree. agents is a comma-separated list (default: "
-    "'claude,gemini'). Returns a run_id. Use get_studio_run / synthesize_studio_run / "
-    "apply_studio_result to follow up.",
-    {"project": str, "instruction": str, "agents": str},
+    "'claude,gemini'). If interactive=true, workers stay alive after the first "
+    "turn so you can steer them mid-flight via send_to_studio_agent and end them "
+    "with finish_studio_run. Default is one-shot (interactive=false). "
+    "Returns a run_id.",
+    {"project": str, "instruction": str, "agents": str, "interactive": bool},
 )
 async def studio_run(args):
     from . import studio
     raw_agents = (args.get("agents") or "claude,gemini").strip()
     agents = [a.strip() for a in raw_agents.split(",") if a.strip()]
+    interactive = bool(args.get("interactive") or False)
     run_id, msg = await studio.start_run(
         project_name=args["project"],
         instruction=args["instruction"],
         agents=agents,
+        interactive=interactive,
     )
+    return _ok(msg)
+
+
+@tool(
+    "send_to_studio_agent",
+    "Send a mid-flight instruction to ONE agent inside an active interactive "
+    "studio run. Only works while the run is still alive and was started with "
+    "interactive=true. Claude supports follow-ups fully; Gemini ignores them "
+    "(first turn only — for now).",
+    {"id": str, "agent": str, "message": str},
+)
+async def send_to_studio_agent(args):
+    from . import studio
+    ok, msg = await studio.send_to_agent(
+        args["id"], args["agent"], args["message"],
+    )
+    return _ok(msg)
+
+
+@tool(
+    "finish_studio_run",
+    "Tell all agents in an interactive studio run to wrap up after their current "
+    "turn. Each agent exits cleanly with the work they have so far. Use this "
+    "instead of cancel_studio_run when you want their output preserved.",
+    {"id": str},
+)
+async def finish_studio_run(args):
+    from . import studio
+    ok, msg = await studio.finish_run(args["id"])
     return _ok(msg)
 
 
@@ -706,6 +739,8 @@ def build_server():
             unwatch_pr,
             list_watched_prs,
             studio_run,
+            send_to_studio_agent,
+            finish_studio_run,
             list_studio_runs,
             get_studio_run,
             synthesize_studio_run,
@@ -737,6 +772,8 @@ ALLOWED_TOOLS = [
     "mcp__friday__unwatch_pr",
     "mcp__friday__list_watched_prs",
     "mcp__friday__studio_run",
+    "mcp__friday__send_to_studio_agent",
+    "mcp__friday__finish_studio_run",
     "mcp__friday__list_studio_runs",
     "mcp__friday__get_studio_run",
     "mcp__friday__synthesize_studio_run",

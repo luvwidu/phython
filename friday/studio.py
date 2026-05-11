@@ -33,6 +33,8 @@ WORKER_REGISTRY: dict[str, type[BaseWorker]] = {
 }
 
 _TASKS: dict[str, asyncio.Task] = {}
+# run_id → {agent_name: asyncio.Queue}.  Only populated for interactive runs.
+_QUEUES: dict[str, dict[str, "asyncio.Queue[Optional[str]]"]] = {}
 
 
 def available_agents() -> list[str]:
@@ -45,12 +47,13 @@ def _notify(run_id: str, msg: str) -> None:
 
 async def _run_one_worker(
     run_id: str, agent: str, repo_path: str, instruction: str, base_sha: str,
+    queue: Optional["asyncio.Queue[Optional[str]]"] = None,
 ) -> WorkerResult:
     wt_path, _ = await worktree.create_worktree(
         repo_path, run_id, agent, base=base_sha,
     )
     cls = WORKER_REGISTRY[agent]
-    w = cls(str(wt_path), base_ref=base_sha)
+    w = cls(str(wt_path), base_ref=base_sha, message_queue=queue)
     return await w.run(instruction)
 
 
@@ -58,9 +61,13 @@ async def _run_loop(run_id: str) -> None:
     run = store.get_studio_run(run_id)
     if not run:
         return
+    queues = _QUEUES.get(run_id, {})
     try:
         coros = [
-            _run_one_worker(run_id, a, run.repo_path, run.instruction, run.base_sha)
+            _run_one_worker(
+                run_id, a, run.repo_path, run.instruction, run.base_sha,
+                queue=queues.get(a),
+            )
             for a in run.agents
         ]
         results = await asyncio.gather(*coros, return_exceptions=True)
@@ -103,12 +110,16 @@ async def _run_loop(run_id: str) -> None:
         _notify(run_id, f"failed: {e}")
     finally:
         _TASKS.pop(run_id, None)
+        _QUEUES.pop(run_id, None)
 
 
 async def start_run(
     project_name: str, instruction: str, agents: list[str],
+    interactive: bool = False,
 ) -> tuple[Optional[str], str]:
-    """Returns (run_id_or_None, message)."""
+    """Returns (run_id_or_None, message). If interactive=True, workers stay alive
+    after the first turn and accept follow-up messages via send_to_agent until
+    finish_run is called."""
     proj = store.get_project(project_name)
     if not proj:
         return None, f"unknown project: {project_name}"
@@ -133,9 +144,15 @@ async def start_run(
         run_id=run_id, project=project_name, repo_path=str(repo),
         instruction=instruction, agents=agents, base_sha=base_sha,
     )
+    if interactive:
+        _QUEUES[run_id] = {a: asyncio.Queue() for a in agents}
     task = asyncio.create_task(_run_loop(run_id))
     _TASKS[run_id] = task
-    return run_id, f"started studio run {run_id} with {len(agents)} agents on {project_name}"
+    mode = "interactive" if interactive else "one-shot"
+    return run_id, (
+        f"started studio run {run_id} ({mode}) with {len(agents)} agents on "
+        f"{project_name}"
+    )
 
 
 def cancel_run(run_id: str) -> str:
@@ -144,6 +161,26 @@ def cancel_run(run_id: str) -> str:
         return f"no active run with id {run_id}"
     task.cancel()
     return f"cancelling {run_id}"
+
+
+async def send_to_agent(run_id: str, agent: str, message: str) -> tuple[bool, str]:
+    qs = _QUEUES.get(run_id)
+    if not qs:
+        return False, f"run {run_id} is not interactive (or already finished)"
+    q = qs.get(agent)
+    if q is None:
+        return False, f"agent '{agent}' is not in run {run_id}"
+    await q.put(message)
+    return True, f"sent to {agent} in {run_id}"
+
+
+async def finish_run(run_id: str) -> tuple[bool, str]:
+    qs = _QUEUES.get(run_id)
+    if not qs:
+        return False, f"run {run_id} is not interactive (or already finished)"
+    for q in qs.values():
+        await q.put(None)  # finish signal — each worker exits after current turn
+    return True, f"sent finish signal to all agents in {run_id}"
 
 
 # --- synthesis (Phase 4) -------------------------------------------------
