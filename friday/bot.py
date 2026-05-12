@@ -16,12 +16,14 @@ Required env vars:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import sys
 import time
 from collections import defaultdict, deque
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -122,6 +124,17 @@ WORK_MODE_TAG = """[WORK MODE — DLP active]
 
 
 log = logging.getLogger("friday.bot")
+
+
+# Per-chat conversation cache. Persisted to disk so that bot restarts
+# (launchd KeepAlive, Mac reboots, manual reloads) do not wipe context.
+# CACHE_MAXLEN: how many turns to keep on disk.
+# INJECT_MAXLEN: how many of the most recent turns to actually replay
+#                inside a Sonnet fallback prompt. Smaller than the cache so
+#                stale turns from hours ago don't bloat the token budget.
+HISTORY_FILE = Path(__file__).resolve().parents[1] / "data" / "chat_history.json"
+HISTORY_CACHE_MAXLEN = 30
+HISTORY_INJECT_MAXLEN = 10
 
 
 # --- safety: dangerous Bash command patterns ------------------------------
@@ -269,7 +282,10 @@ class BotState:
         # per-chat recent turns: (user_msg, bot_response) tuples. Used to
         # restore conversation context when we fall back to the Sonnet
         # client (which has its own empty history) or after a bot restart.
-        self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=5))
+        # Populated by _load_history() in _main(); persisted by _save_history().
+        self.history: dict[int, deque] = defaultdict(
+            lambda: deque(maxlen=HISTORY_CACHE_MAXLEN)
+        )
 
 
 state = BotState()
@@ -384,33 +400,80 @@ async def _try_one_client(client, prompt: str, chat_id: int, bot) -> tuple[bool,
 OPUS_RETRY_DELAY_SEC = 5.0
 
 
+def _load_history() -> dict[int, deque]:
+    h: dict[int, deque] = defaultdict(
+        lambda: deque(maxlen=HISTORY_CACHE_MAXLEN)
+    )
+    if not HISTORY_FILE.exists():
+        return h
+    try:
+        raw = json.loads(HISTORY_FILE.read_text("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"chat history load failed: {exc}")
+        return h
+    for cid_str, turns in (raw or {}).items():
+        try:
+            cid = int(cid_str)
+        except (TypeError, ValueError):
+            continue
+        for t in turns or []:
+            if isinstance(t, list) and len(t) == 2:
+                h[cid].append((t[0], t[1]))
+    log.info(
+        f"loaded chat history: {sum(len(v) for v in h.values())} turns "
+        f"across {len(h)} chats"
+    )
+    return h
+
+
+def _save_history() -> None:
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            str(cid): [list(t) for t in turns]
+            for cid, turns in state.history.items()
+            if turns
+        }
+        tmp = HISTORY_FILE.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tmp.replace(HISTORY_FILE)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"chat history save failed: {exc}")
+
+
 def _remember_turn(chat_id: int, user_msg: str, bot_response: str) -> None:
     """Cache a completed turn so we can replay it as inline context on
-    fallback. Skip bot-side errors so we don't poison the history."""
+    fallback. Skip bot-side errors so we don't poison the history.
+    Persists to disk after every successful turn — the file is small
+    (kilobytes) and the bot is single-writer."""
     user_msg = (user_msg or "").strip()
     bot_response = (bot_response or "").strip()
     if not bot_response or bot_response.startswith("[bot error]"):
         return
-    # cap each side so we don't bloat the fallback prompt
     if len(bot_response) > 2000:
         bot_response = bot_response[:2000] + "...(truncated)"
     if len(user_msg) > 1000:
         user_msg = user_msg[:1000] + "...(truncated)"
     state.history[chat_id].append((user_msg, bot_response))
+    _save_history()
 
 
 def _format_history_for_fallback(chat_id: int) -> str:
-    """Render recent turns as an inline context block to prepend to the
-    fallback prompt. The Sonnet client has its own empty history; without
-    this, it sees only the new user message and forgets earlier turns."""
+    """Render the most recent INJECT turns as an inline context block to
+    prepend to the fallback prompt. The Sonnet client has its own empty
+    history; without this, it sees only the new user message and forgets
+    earlier turns."""
     h = state.history.get(chat_id)
     if not h:
         return ""
+    recent = list(h)[-HISTORY_INJECT_MAXLEN:]
     lines = [
         "[직전 대화 컨텍스트 — Opus 가 과부하라 Sonnet 으로 전환됨. "
         "다음은 이 대화의 최근 기록이니 참고해서 답하라:]",
     ]
-    for user_msg, bot_response in h:
+    for user_msg, bot_response in recent:
         lines.append(f"USER: {user_msg}")
         lines.append(f"FRIDAY: {bot_response}")
     lines.append("[/직전 대화 컨텍스트]")
@@ -792,6 +855,7 @@ async def _main() -> None:
     log.info(sync.init())
     if source:
         log.info(f"loaded {len(extra_servers)} extra MCP server(s) from {source}")
+    state.history = _load_history()
     resume_watchers()
     sync.schedule_sync()
 
