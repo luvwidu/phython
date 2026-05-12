@@ -259,7 +259,8 @@ async def _safe_send(bot, chat_id: int, text: str) -> bool:
 
 class BotState:
     def __init__(self) -> None:
-        self.client: Optional[ClaudeSDKClient] = None
+        self.client: Optional[ClaudeSDKClient] = None             # Opus 4.7 primary
+        self.client_fallback: Optional[ClaudeSDKClient] = None    # Sonnet 4.6 fallback
         self.lock = asyncio.Lock()
         self.allowed_ids: set[int] = set()
         self.notify_chats: set[int] = set()
@@ -308,6 +309,78 @@ def _render_error(msg) -> Optional[str]:
     if isinstance(msg, ResultMessage) and msg.is_error:
         return f"[error] {msg.result}"
     return None
+
+
+# Substrings that mark an Anthropic-side capacity / transient issue worth
+# falling back to Sonnet for. Matched case-insensitive against either an
+# exception string or the SDK's ResultMessage.result text.
+_TRANSIENT_MARKERS = (
+    "529",
+    "overloaded",
+    "repeated 5",       # SDK aggregates "Repeated 5XX errors"
+    "rate limit",
+    "service_unavailable",
+)
+
+
+def _is_transient(s: str) -> bool:
+    s = s.lower()
+    return any(m in s for m in _TRANSIENT_MARKERS)
+
+
+async def _try_one_client(client, prompt: str, chat_id: int, bot) -> tuple[bool, str]:
+    """Run one turn through ``client``, streaming tool-use progress to chat.
+
+    Returns ``(transient_failure, response_text)``.
+
+    ``transient_failure=True`` means the model returned an Anthropic-side
+    capacity error before producing any useful text — caller may retry on
+    the fallback client. If some text was already produced, we keep it and
+    do not flag transient (partial answer beats no answer).
+    """
+    text_parts: list[str] = []
+    try:
+        await client.query(prompt)
+        async for msg in client.receive_response():
+            progress, body = _render_assistant(msg)
+            for line in progress:
+                await _safe_send(bot, chat_id, line)
+            if body:
+                text_parts.append(body)
+            err = _render_error(msg)
+            if err:
+                if _is_transient(err) and not text_parts:
+                    return True, err
+                text_parts.append(err)
+    except Exception as exc:  # noqa: BLE001
+        s = str(exc)
+        if _is_transient(s) and not text_parts:
+            return True, s
+        log.exception("error in client turn")
+        text_parts.append(f"[bot error] {s}")
+    return False, "\n".join(text_parts).strip() or "(no response)"
+
+
+async def _process_turn(prompt: str, chat_id: int, bot) -> str:
+    """Run a turn against primary (Opus); fall back to Sonnet on transient.
+
+    Caller is responsible for sending the returned text (split if needed).
+    Tool-use progress is streamed inside the helpers via ``_safe_send``.
+    """
+    if state.client is None:
+        return "[bot error] client not ready"
+    transient, response = await _try_one_client(state.client, prompt, chat_id, bot)
+    if not transient:
+        return response
+    if state.client_fallback is None:
+        return response  # surface the original error
+    await _safe_send(bot, chat_id, "⚠️ Opus 일시 과부하 — Sonnet 4.6 으로 전환")
+    transient2, response2 = await _try_one_client(
+        state.client_fallback, prompt, chat_id, bot
+    )
+    if transient2:
+        return f"[bot error] Opus 와 Sonnet 모두 일시 과부하\n{response2}"
+    return response2
 
 
 def _split_message(text: str, max_len: int = MAX_MESSAGE_LEN) -> list[str]:
@@ -495,22 +568,8 @@ async def cmd_abstract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     async with state.lock:
         typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
-        text_parts: list[str] = []
         try:
-            await state.client.query(prompt)
-            async for msg in state.client.receive_response():
-                progress, text = _render_assistant(msg)
-                for line in progress:
-                    await _safe_send(context.bot, chat_id, line)
-                if text:
-                    text_parts.append(text)
-                err = _render_error(msg)
-                if err:
-                    text_parts.append(err)
-            response = "\n".join(text_parts).strip() or "(no response)"
-        except Exception as exc:  # noqa: BLE001
-            log.exception("error processing /abstract")
-            response = f"[bot error] {exc}"
+            response = await _process_turn(prompt, chat_id, context.bot)
         finally:
             typing_task.cancel()
             try:
@@ -553,28 +612,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     async with state.lock:
         typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
-        response: str
         try:
             prepared = (
                 WORK_MODE_TAG + text
                 if chat_id in state.work_mode_chats
                 else text
             )
-            await state.client.query(prepared)
-            text_parts: list[str] = []
-            async for msg in state.client.receive_response():
-                progress, body = _render_assistant(msg)
-                for line in progress:
-                    await _safe_send(context.bot, chat_id, line)
-                if body:
-                    text_parts.append(body)
-                err = _render_error(msg)
-                if err:
-                    text_parts.append(err)
-            response = "\n".join(text_parts).strip() or "(no response)"
-        except Exception as exc:  # noqa: BLE001
-            log.exception("error processing message")
-            response = f"[bot error] {exc}"
+            response = await _process_turn(prepared, chat_id, context.bot)
         finally:
             typing_task.cancel()
             try:
@@ -647,22 +691,24 @@ async def _main() -> None:
 
     server = build_server()
     extra_servers, extra_allowed, source = load_mcp_config()
-    options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT + TELEGRAM_PROMPT_SUFFIX,
-        mcp_servers={"friday": server, **extra_servers},
-        allowed_tools=ALLOWED_TOOLS + extra_allowed,
-        # AskUserQuestion + ExitPlanMode return empty in headless contexts;
-        # the model would then proceed with assumptions. Force it to ask
-        # follow-ups as plain text instead.
-        disallowed_tools=["AskUserQuestion", "ExitPlanMode"],
-        agents=REGISTRY,
-        model="claude-opus-4-7",
-        # bot has no interactive approval channel → bypass + gated by
-        # can_use_tool. The callback blocks dangerous Bash patterns.
-        permission_mode="bypassPermissions",
-        can_use_tool=_can_use_tool,
-        setting_sources=["user"],
-    )
+
+    def _make_options(model: str) -> ClaudeAgentOptions:
+        return ClaudeAgentOptions(
+            system_prompt=SYSTEM_PROMPT + TELEGRAM_PROMPT_SUFFIX,
+            mcp_servers={"friday": server, **extra_servers},
+            allowed_tools=ALLOWED_TOOLS + extra_allowed,
+            # AskUserQuestion + ExitPlanMode return empty in headless contexts;
+            # the model would then proceed with assumptions. Force it to ask
+            # follow-ups as plain text instead.
+            disallowed_tools=["AskUserQuestion", "ExitPlanMode"],
+            agents=REGISTRY,
+            model=model,
+            # bot has no interactive approval channel → bypass + gated by
+            # can_use_tool. The callback blocks dangerous Bash patterns.
+            permission_mode="bypassPermissions",
+            can_use_tool=_can_use_tool,
+            setting_sources=["user"],
+        )
 
     log.info(sync.init())
     if source:
@@ -670,9 +716,17 @@ async def _main() -> None:
     resume_watchers()
     sync.schedule_sync()
 
-    state.client = ClaudeSDKClient(options=options)
+    # Primary = Opus 4.7, Fallback = Sonnet 4.6. The fallback is only used
+    # when Opus returns a transient capacity error (529, overloaded) before
+    # producing any output. Conversation context lives on the primary; the
+    # fallback runs the offending turn standalone, so multi-turn coherence
+    # may degrade slightly across an Opus outage. Acceptable tradeoff for
+    # never-down responsiveness.
+    state.client = ClaudeSDKClient(options=_make_options("claude-opus-4-7"))
+    state.client_fallback = ClaudeSDKClient(options=_make_options("claude-sonnet-4-6"))
     await state.client.__aenter__()
-    log.info("claude sdk client ready")
+    await state.client_fallback.__aenter__()
+    log.info("claude sdk clients ready (primary=opus-4-7, fallback=sonnet-4-6)")
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -711,11 +765,12 @@ async def _main() -> None:
             await app.shutdown()
         except Exception:
             pass
-        if state.client is not None:
-            try:
-                await state.client.__aexit__(None, None, None)
-            except Exception:
-                pass
+        for c in (state.client, state.client_fallback):
+            if c is not None:
+                try:
+                    await c.__aexit__(None, None, None)
+                except Exception:
+                    pass
 
 
 def run() -> None:
