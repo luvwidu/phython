@@ -43,6 +43,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -63,6 +64,12 @@ from .watcher import resume_all as resume_watchers
 MAX_MESSAGE_LEN = 3900  # Telegram hard limit is 4096; leave headroom
 TYPING_REFRESH_SEC = 4
 NOTIFICATIONS_POLL_SEC = 5
+
+# Retry policy for send_message when the network drops (Mac sleep, Wi-Fi
+# hiccup, etc.). Polling itself recovers automatically inside PTB, but
+# outbound sends do not — without retry they vanish silently.
+SEND_MAX_RETRIES = 6
+SEND_BACKOFF_BASE = 1.5  # seconds; exponential: 1.5, 3, 6, 12, 24, capped 60
 
 # Rate limit: per-user sliding window
 RATE_LIMIT_MSGS = 20
@@ -186,6 +193,45 @@ def _rate_limit_check(user_id: int) -> tuple[bool, float]:
     return True, 0.0
 
 
+# --- resilient sending ----------------------------------------------------
+
+
+async def _safe_send(bot, chat_id: int, text: str) -> bool:
+    """Send a Telegram message, retrying on transient network failures.
+
+    Returns True if delivered, False if all retries were exhausted.
+    """
+    delay = SEND_BACKOFF_BASE
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, SEND_MAX_RETRIES + 1):
+        try:
+            await bot.send_message(chat_id, text)
+            if attempt > 1:
+                log.info(f"send_message recovered on attempt {attempt}")
+            return True
+        except (NetworkError, TimedOut) as exc:
+            last_exc = exc
+            if attempt == SEND_MAX_RETRIES:
+                break
+            log.warning(
+                f"send_message network error (attempt {attempt}/"
+                f"{SEND_MAX_RETRIES}): {exc}; retrying in {delay:.1f}s"
+            )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            delay = min(delay * 2, 60.0)
+        except Exception as exc:  # noqa: BLE001
+            # non-network error: don't retry, but don't crash the handler
+            log.warning(f"send_message failed (non-network): {exc}")
+            return False
+    log.error(
+        f"send_message gave up after {SEND_MAX_RETRIES} retries: {last_exc}"
+    )
+    return False
+
+
 class BotState:
     def __init__(self) -> None:
         self.client: Optional[ClaudeSDKClient] = None
@@ -261,13 +307,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user is None or not _is_allowed(user.id):
         return
-    state.notify_chats.add(update.effective_chat.id)
-    await update.message.reply_text(
+    chat_id = update.effective_chat.id
+    state.notify_chats.add(chat_id)
+    await _safe_send(
+        context.bot,
+        chat_id,
         "Friday 가동 중.\n"
         "메시지를 보내면 작업을 진행합니다.\n\n"
         "/status — 프로젝트/잡 현황\n"
         "/id — 내 텔레그램 ID 확인\n"
-        "/help — 사용법"
+        "/help — 사용법",
     )
 
 
@@ -275,12 +324,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user is None or not _is_allowed(user.id):
         return
-    await update.message.reply_text(
+    await _safe_send(
+        context.bot,
+        update.effective_chat.id,
         "사용법\n"
         "• 자연어로 지시하면 Friday가 처리합니다.\n"
         "• 백그라운드 잡 완료, PR 코멘트 등은 알림으로 푸시됩니다.\n"
         "• 응답이 길면 여러 메시지로 분할됩니다.\n"
-        "• 한 번에 한 메시지만 처리 (다음 메시지는 큐에서 대기)."
+        "• 한 번에 한 메시지만 처리 (다음 메시지는 큐에서 대기).",
     )
 
 
@@ -288,8 +339,10 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # accessible to anyone — needed for initial whitelist setup
     if update.effective_user is None:
         return
-    await update.message.reply_text(
-        f"your telegram id: {update.effective_user.id}"
+    await _safe_send(
+        context.bot,
+        update.effective_chat.id,
+        f"your telegram id: {update.effective_user.id}",
     )
 
 
@@ -312,7 +365,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append("")
         for j in running_jobs[:5]:
             lines.append(f"  · {j.id} {j.repo_path}")
-    await update.message.reply_text("\n".join(lines))
+    await _safe_send(context.bot, update.effective_chat.id, "\n".join(lines))
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -330,16 +383,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     allowed, retry_in = _rate_limit_check(user.id)
     if not allowed:
-        await update.message.reply_text(
+        await _safe_send(
+            context.bot,
+            chat_id,
             f"⏱ 분당 메시지 제한 초과 ({RATE_LIMIT_MSGS}/{int(RATE_LIMIT_WINDOW)}s). "
-            f"{int(retry_in) + 1}초 후 다시 시도해주세요."
+            f"{int(retry_in) + 1}초 후 다시 시도해주세요.",
         )
         return
 
     log.info(f"[{user.id}] → {text[:120]}")
 
     if state.client is None:
-        await context.bot.send_message(chat_id, "[bot error] client not ready")
+        await _safe_send(context.bot, chat_id, "[bot error] client not ready")
         return
 
     async with state.lock:
@@ -364,10 +419,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
 
         for chunk in _split_message(response):
-            try:
-                await context.bot.send_message(chat_id, chunk)
-            except Exception as exc:  # noqa: BLE001
-                log.warning(f"failed to send chunk: {exc}")
+            await _safe_send(context.bot, chat_id, chunk)
 
 
 # --- background notifications --------------------------------------------
@@ -386,10 +438,7 @@ async def notifications_loop(app: Application) -> None:
                 lines.append(f"[{ts}] {n.get('text', '')}")
             text = "🔔 알림\n" + "\n".join(lines)
             for chat_id in list(state.notify_chats):
-                try:
-                    await app.bot.send_message(chat_id, text)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning(f"notification send failed for {chat_id}: {exc}")
+                await _safe_send(app.bot, chat_id, text)
         except asyncio.CancelledError:
             return
         except Exception as exc:  # noqa: BLE001
