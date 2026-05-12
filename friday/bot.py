@@ -266,6 +266,10 @@ class BotState:
         self.notify_chats: set[int] = set()
         # chat_ids where Work Mode (DLP-safe consulting) is currently active
         self.work_mode_chats: set[int] = set()
+        # per-chat recent turns: (user_msg, bot_response) tuples. Used to
+        # restore conversation context when we fall back to the Sonnet
+        # client (which has its own empty history) or after a bot restart.
+        self.history: dict[int, deque] = defaultdict(lambda: deque(maxlen=5))
 
 
 state = BotState()
@@ -374,22 +378,80 @@ async def _try_one_client(client, prompt: str, chat_id: int, bot) -> tuple[bool,
     return False, "\n".join(text_parts).strip() or "(no response)"
 
 
-async def _process_turn(prompt: str, chat_id: int, bot) -> str:
-    """Run a turn against primary (Opus); fall back to Sonnet on transient.
+# Backoff before retrying Opus after a transient error. Anthropic capacity
+# spikes are often short, so a brief wait + same-client retry usually wins
+# without losing conversation history.
+OPUS_RETRY_DELAY_SEC = 5.0
 
-    Caller is responsible for sending the returned text (split if needed).
-    Tool-use progress is streamed inside the helpers via ``_safe_send``.
+
+def _remember_turn(chat_id: int, user_msg: str, bot_response: str) -> None:
+    """Cache a completed turn so we can replay it as inline context on
+    fallback. Skip bot-side errors so we don't poison the history."""
+    user_msg = (user_msg or "").strip()
+    bot_response = (bot_response or "").strip()
+    if not bot_response or bot_response.startswith("[bot error]"):
+        return
+    # cap each side so we don't bloat the fallback prompt
+    if len(bot_response) > 2000:
+        bot_response = bot_response[:2000] + "...(truncated)"
+    if len(user_msg) > 1000:
+        user_msg = user_msg[:1000] + "...(truncated)"
+    state.history[chat_id].append((user_msg, bot_response))
+
+
+def _format_history_for_fallback(chat_id: int) -> str:
+    """Render recent turns as an inline context block to prepend to the
+    fallback prompt. The Sonnet client has its own empty history; without
+    this, it sees only the new user message and forgets earlier turns."""
+    h = state.history.get(chat_id)
+    if not h:
+        return ""
+    lines = [
+        "[직전 대화 컨텍스트 — Opus 가 과부하라 Sonnet 으로 전환됨. "
+        "다음은 이 대화의 최근 기록이니 참고해서 답하라:]",
+    ]
+    for user_msg, bot_response in h:
+        lines.append(f"USER: {user_msg}")
+        lines.append(f"FRIDAY: {bot_response}")
+    lines.append("[/직전 대화 컨텍스트]")
+    return "\n".join(lines) + "\n\n"
+
+
+async def _process_turn(prompt: str, chat_id: int, bot) -> str:
+    """Run a turn through Opus; on transient capacity error retry Opus
+    once after a short delay, then fall back to Sonnet with inline
+    history. Caller is responsible for sending the returned text.
     """
     if state.client is None:
         return "[bot error] client not ready"
+
+    # 1) Primary: Opus 4.7
     transient, response = await _try_one_client(state.client, prompt, chat_id, bot)
     if not transient:
         return response
+
+    # 2) Brief backoff + same-client retry. Anthropic capacity spikes are
+    #    usually short; this often clears without losing the Opus history.
+    await _safe_send(
+        bot, chat_id,
+        f"⏳ Opus 일시 과부하 — {int(OPUS_RETRY_DELAY_SEC)}초 후 재시도",
+    )
+    await asyncio.sleep(OPUS_RETRY_DELAY_SEC)
+    transient, response = await _try_one_client(state.client, prompt, chat_id, bot)
+    if not transient:
+        return response
+
+    # 3) Sonnet fallback with inline conversation context, since the Sonnet
+    #    client does not share history with Opus.
     if state.client_fallback is None:
-        return response  # surface the original error
-    await _safe_send(bot, chat_id, "⚠️ Opus 일시 과부하 — Sonnet 4.6 으로 전환")
+        return response
+    await _safe_send(
+        bot, chat_id,
+        "⚠️ Opus 재시도도 실패 — Sonnet 4.6 으로 전환 (이전 대화 컨텍스트 동봉)",
+    )
+    fallback_prompt = _format_history_for_fallback(chat_id) + prompt
     transient2, response2 = await _try_one_client(
-        state.client_fallback, prompt, chat_id, bot
+        state.client_fallback, fallback_prompt, chat_id, bot
     )
     if transient2:
         return f"[bot error] Opus 와 Sonnet 모두 일시 과부하\n{response2}"
@@ -592,6 +654,7 @@ async def cmd_abstract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         for chunk in _split_message(response):
             await _safe_send(context.bot, chat_id, chunk)
+        _remember_turn(chat_id, args_text, response)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -641,6 +704,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         for chunk in _split_message(response):
             await _safe_send(context.bot, chat_id, chunk)
+        # Remember the *raw* user text (without WORK_MODE_TAG) so fallback
+        # context replay stays compact and readable.
+        _remember_turn(chat_id, text, response)
 
 
 # --- background notifications --------------------------------------------
