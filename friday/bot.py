@@ -333,12 +333,15 @@ async def _try_one_client(client, prompt: str, chat_id: int, bot) -> tuple[bool,
 
     Returns ``(transient_failure, response_text)``.
 
-    ``transient_failure=True`` means the model returned an Anthropic-side
-    capacity error before producing any useful text — caller may retry on
-    the fallback client. If some text was already produced, we keep it and
-    do not flag transient (partial answer beats no answer).
+    ``transient_failure=True`` means the model produced no useful text and
+    we observed an Anthropic-side capacity marker — caller may retry on the
+    fallback client. A transient error often arrives twice: once as a
+    TextBlock inside AssistantMessage and again as ResultMessage.is_error.
+    We filter both out of the accumulated text so a real partial answer
+    can still survive, but a bare error does not block the fallback.
     """
     text_parts: list[str] = []
+    saw_transient = False
     try:
         await client.query(prompt)
         async for msg in client.receive_response():
@@ -346,18 +349,28 @@ async def _try_one_client(client, prompt: str, chat_id: int, bot) -> tuple[bool,
             for line in progress:
                 await _safe_send(bot, chat_id, line)
             if body:
-                text_parts.append(body)
+                if _is_transient(body):
+                    saw_transient = True
+                else:
+                    text_parts.append(body)
             err = _render_error(msg)
             if err:
-                if _is_transient(err) and not text_parts:
-                    return True, err
-                text_parts.append(err)
+                if _is_transient(err):
+                    saw_transient = True
+                else:
+                    text_parts.append(err)
     except Exception as exc:  # noqa: BLE001
         s = str(exc)
-        if _is_transient(s) and not text_parts:
-            return True, s
-        log.exception("error in client turn")
-        text_parts.append(f"[bot error] {s}")
+        if _is_transient(s):
+            saw_transient = True
+        else:
+            log.exception("error in client turn")
+            text_parts.append(f"[bot error] {s}")
+    if saw_transient and not text_parts:
+        return True, "Anthropic capacity error"
+    if saw_transient and text_parts:
+        # partial answer + later transient: surface the partial, note the gap
+        text_parts.append("[note] 응답 도중 일시 과부하 — 부분 답만 도착")
     return False, "\n".join(text_parts).strip() or "(no response)"
 
 
