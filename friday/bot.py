@@ -277,20 +277,36 @@ def _is_allowed(user_id: int) -> bool:
     return user_id in state.allowed_ids
 
 
-def _render_message(msg) -> Optional[str]:
-    if isinstance(msg, AssistantMessage):
-        parts: list[str] = []
-        for block in msg.content:
-            if isinstance(block, TextBlock):
-                parts.append(block.text)
-            elif isinstance(block, ToolUseBlock):
-                parts.append(f"· {block.name}")
-            elif isinstance(block, ThinkingBlock):
-                pass
-        return "\n".join(parts) if parts else None
-    if isinstance(msg, ResultMessage):
-        if msg.is_error:
-            return f"[error] {msg.result}"
+def _render_assistant(msg) -> tuple[list[str], Optional[str]]:
+    """Split an assistant message into (progress_lines, final_text).
+
+    - progress_lines: emitted to Telegram immediately so the user can see
+      the bot is alive and which tool it is calling.
+    - final_text: accumulated and sent in one block at the end of the turn.
+    """
+    if not isinstance(msg, AssistantMessage):
+        return [], None
+    progress: list[str] = []
+    text_parts: list[str] = []
+    for block in msg.content:
+        if isinstance(block, TextBlock):
+            text_parts.append(block.text)
+        elif isinstance(block, ToolUseBlock):
+            name = block.name
+            if name.startswith("mcp__friday__"):
+                name = name[len("mcp__friday__"):]
+            elif name.startswith("mcp__"):
+                name = name.split("__", 2)[-1]
+            progress.append(f"🔧 {name}")
+        elif isinstance(block, ThinkingBlock):
+            pass
+    text = "\n".join(text_parts) if text_parts else None
+    return progress, text
+
+
+def _render_error(msg) -> Optional[str]:
+    if isinstance(msg, ResultMessage) and msg.is_error:
+        return f"[error] {msg.result}"
     return None
 
 
@@ -479,14 +495,19 @@ async def cmd_abstract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     async with state.lock:
         typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
+        text_parts: list[str] = []
         try:
             await state.client.query(prompt)
-            parts: list[str] = []
             async for msg in state.client.receive_response():
-                fragment = _render_message(msg)
-                if fragment:
-                    parts.append(fragment)
-            response = "\n".join(parts).strip() or "(no response)"
+                progress, text = _render_assistant(msg)
+                for line in progress:
+                    await _safe_send(context.bot, chat_id, line)
+                if text:
+                    text_parts.append(text)
+                err = _render_error(msg)
+                if err:
+                    text_parts.append(err)
+            response = "\n".join(text_parts).strip() or "(no response)"
         except Exception as exc:  # noqa: BLE001
             log.exception("error processing /abstract")
             response = f"[bot error] {exc}"
@@ -540,12 +561,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 else text
             )
             await state.client.query(prepared)
-            parts: list[str] = []
+            text_parts: list[str] = []
             async for msg in state.client.receive_response():
-                fragment = _render_message(msg)
-                if fragment:
-                    parts.append(fragment)
-            response = "\n".join(parts).strip() or "(no response)"
+                progress, body = _render_assistant(msg)
+                for line in progress:
+                    await _safe_send(context.bot, chat_id, line)
+                if body:
+                    text_parts.append(body)
+                err = _render_error(msg)
+                if err:
+                    text_parts.append(err)
+            response = "\n".join(text_parts).strip() or "(no response)"
         except Exception as exc:  # noqa: BLE001
             log.exception("error processing message")
             response = f"[bot error] {exc}"
