@@ -161,7 +161,65 @@ launchctl load -w ~/Library/LaunchAgents/com.사장님.friday-bot.plist
 ```
 
 
-## 8. 보안 노트
+## 8. GitHub Drop (긴 산출물 회사 PC로 전달)
+
+회사 PC에는 Friday가 직접 접근 못함. 긴 보고서·설계서·문서 초안 같은 산출물을
+회사에서 받아보려면 **개인 GitHub private repo를 드롭 채널로** 사용.
+
+### 셋업 (1회)
+
+1. **개인 GitHub에 private repo 생성** — 이름은 자유 (예: `yourname/friday-drop`).
+   웹에서 New → Private → README 옵션은 켜두면 편함.
+2. **집 Mac에서 `gh auth login`** — 이미 했으면 스킵. `gh auth status` 로 확인.
+3. **`.env`에 추가**:
+   ```
+   FRIDAY_DROP_REPO=yourname/friday-drop
+   ```
+4. **회사 PC 브라우저에 repo URL 북마크** — `https://github.com/yourname/friday-drop`
+
+### 동작 흐름
+
+```
+사장님 폰: /work on
+사장님 폰: 경쟁사 동향 보고서 초안 만들어줘
+   ↓
+Friday: WebSearch + 분석 후 보고서 작성
+   ↓ drop_to_github 도구로 push
+GitHub: yourname/friday-drop/2026-05-12-143022-competitor-report.md
+   ↓
+Friday → 폰: "초안 완료 → https://github.com/.../2026-05-12-...md (요약 3줄)"
+   ↓
+사장님: 회사 PC 브라우저에서 URL 클릭
+   ↓ 콘텐츠 보기/복사
+회사 PC M365 Copilot: "이 구조로 우리 보고서 형식에 맞춰 다듬어줘"
+```
+
+### 자동 vs 수동
+
+Work Mode 켜져있으면 Friday가 응답이 길어질 때 (대략 500자 이상) **자동으로**
+drop 합니다. 텔레그램에는 짧은 요약 + URL만 와요.
+
+명시적으로 drop 하고 싶을 때:
+```
+이 회의록 정리해서 GitHub에 올려줘
+```
+
+`drop_to_github` 는 REPL 에서도 사용 가능합니다 (집에서 Friday랑 작업하다
+"이거 회사 PC에서도 보고싶다" 싶을 때).
+
+### 자주 묻는
+
+- **여러 파일 한 번에 올릴 수 있어요?** — 한 번에 하나. 여러 개면 도구가
+  여러 번 호출됨.
+- **이미 있는 파일 덮어쓰나요?** — 파일명에 자동 타임스탬프가 붙어서 충돌
+  없음. 같은 파일명 유지하고 싶으면 `filename` 인자에 `YYYY-MM-DD-` 시작하는
+  이름 명시.
+- **컴플라이언스 안전한가요?** — Friday가 다루는 콘텐츠는 사장님이 추상화해서
+  준 묘사 + 공개 웹 정보만. 회사 코드/데이터 0. 사장님이 회사 PC에서 GitHub
+  여는 행위는 평범한 개발자 행동.
+
+
+## 9. 보안 노트
 
 봇은 다음 가드레일을 코드 레벨에서 강제합니다:
 
@@ -197,7 +255,7 @@ launchctl load -w ~/Library/LaunchAgents/com.사장님.friday-bot.plist
 - 정규식 기반 차단은 우회 시도에 약함 (`s​udo` 같은 zero-width 삽입 등).
   완벽한 방어가 아니라 실수 방지용. 화이트리스트가 1차 방어선.
 
-## 9. 동작 방식
+## 10. 동작 방식
 
 - REPL과 동일한 `ClaudeSDKClient` 한 개를 봇 수명 내내 공유.
 - 한 번에 한 메시지만 처리(asyncio.Lock). 처리 중에 새 메시지가 와도
@@ -206,7 +264,7 @@ launchctl load -w ~/Library/LaunchAgents/com.사장님.friday-bot.plist
 - 백그라운드 잡 완료, PR 감시 알림 등은 5초마다 폴링해서 푸시.
 - Mac 슬립 들어가도 텔레그램 서버가 메시지 보관 → 깨어나면 받아 처리.
 
-## 10. 문제 해결
+## 11. 문제 해결
 
 | 증상 | 원인 / 해결 |
 |---|---|

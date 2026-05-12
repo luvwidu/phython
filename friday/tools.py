@@ -6,7 +6,11 @@ background Claude Code jobs that live inside other repositories.
 from __future__ import annotations
 
 import asyncio
+import base64
+import os
+import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -714,6 +718,71 @@ async def list_watched_prs(args):
     return _ok("\n".join(lines))
 
 
+# --- GitHub drop (cross-device delivery channel) -------------------------
+
+
+@tool(
+    "drop_to_github",
+    "Save content to the user's personal GitHub 'drop' repo (configured via "
+    "FRIDAY_DROP_REPO env var, format owner/name). Use when the user needs to "
+    "retrieve Friday's output from a different device — they open the returned "
+    "URL in any browser (e.g. work PC). Recommended for any Work-Mode response "
+    "longer than ~500 chars or any multi-section deliverable (reports, plans, "
+    "drafts, structured prompts). filename optional — timestamp prefix added "
+    "automatically if missing. Returns the URL.",
+    {"filename": str, "content": str, "message": str},
+)
+async def drop_to_github(args):
+    repo = os.environ.get("FRIDAY_DROP_REPO", "").strip()
+    if not repo:
+        return _ok(
+            "error: FRIDAY_DROP_REPO not set. Add `FRIDAY_DROP_REPO=owner/name` "
+            "to .env (create a private repo on GitHub first; `gh auth login` "
+            "must already be done)."
+        )
+
+    content = args.get("content", "")
+    if not content:
+        return _ok("error: content is required")
+
+    requested = (args.get("filename") or "").strip().lstrip("/")
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    if not requested:
+        filename = f"{timestamp}.md"
+    elif re.match(r"^\d{4}-\d{2}-\d{2}", requested):
+        filename = requested
+    else:
+        base = requested if "." in requested else f"{requested}.md"
+        filename = f"{timestamp}-{base}"
+
+    commit_message = args.get("message") or f"drop {filename}"
+    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+
+    proc = await asyncio.create_subprocess_exec(
+        "gh", "api", f"repos/{repo}/contents/{filename}",
+        "--method", "PUT",
+        "--field", f"message={commit_message}",
+        "--field", f"content={encoded}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return _ok("error: gh api timed out after 30s")
+
+    out = stdout.decode("utf-8", "replace").strip()
+    err = stderr.decode("utf-8", "replace").strip()
+    if proc.returncode != 0:
+        msg = err or out or "(no error message)"
+        return _ok(f"failed to drop: {msg}"[:600])
+
+    url = f"https://github.com/{repo}/blob/main/{filename}"
+    raw_url = f"https://raw.githubusercontent.com/{repo}/main/{filename}"
+    return _ok(f"dropped → {url}\nraw → {raw_url}")
+
+
 def build_server():
     return create_sdk_mcp_server(
         name="friday",
@@ -747,6 +816,7 @@ def build_server():
             apply_studio_result,
             cleanup_studio_run,
             cancel_studio_run,
+            drop_to_github,
         ],
     )
 
@@ -780,6 +850,7 @@ ALLOWED_TOOLS = [
     "mcp__friday__apply_studio_result",
     "mcp__friday__cleanup_studio_run",
     "mcp__friday__cancel_studio_run",
+    "mcp__friday__drop_to_github",
     "Task",
     "Read",
     "Bash",
