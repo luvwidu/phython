@@ -96,6 +96,28 @@ Chat-style interaction (Telegram):
 """
 
 
+# Prepended to a user's message when Work Mode is ON for that chat. Tells the
+# model the user is at a workplace with DLP active and must not be asked to
+# share code, and that outputs should be optimized for paste into GitHub
+# Copilot at work.
+WORK_MODE_TAG = """[WORK MODE — DLP active]
+사장님은 회사 환경에서 작업 중. 회사 코드/데이터는 텔레그램으로 절대
+오지 않음. 다음 원칙으로 응답:
+
+- "코드 보여달라" 요청 금지. 묘사만으로 추론.
+- 회사 코드/제품/팀/내부 도메인 식별자가 메시지에 우연히 섞이면 즉시
+  "그 식별자는 DLP 위험. 일반 용어로 다시 부탁드려요" 안내.
+- 응답은 두 부분:
+  (a) 한국어 간결 설명 (3-5줄) — 설계 원칙 또는 단계
+  (b) 영문 Copilot 프롬프트 코드블록 — 회사 PC Copilot에 그대로 또는
+      살짝 변형해 입력 가능한 형태. 명령형, 짧고 구체적.
+- Shell/git 명령어가 답이라면 copilot_suggest 도구로 한 번 사전 검증한
+  후 보내라 (없으면 그냥 추천).
+
+사장님 메시지:
+"""
+
+
 log = logging.getLogger("friday.bot")
 
 
@@ -238,6 +260,8 @@ class BotState:
         self.lock = asyncio.Lock()
         self.allowed_ids: set[int] = set()
         self.notify_chats: set[int] = set()
+        # chat_ids where Work Mode (DLP-safe consulting) is currently active
+        self.work_mode_chats: set[int] = set()
 
 
 state = BotState()
@@ -315,6 +339,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Friday 가동 중.\n"
         "메시지를 보내면 작업을 진행합니다.\n\n"
         "/status — 프로젝트/잡 현황\n"
+        "/work — DLP-안전 모드 토글\n"
+        "/abstract — 묘사를 DLP-안전 표현으로 변환\n"
         "/id — 내 텔레그램 ID 확인\n"
         "/help — 사용법",
     )
@@ -331,7 +357,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• 자연어로 지시하면 Friday가 처리합니다.\n"
         "• 백그라운드 잡 완료, PR 코멘트 등은 알림으로 푸시됩니다.\n"
         "• 응답이 길면 여러 메시지로 분할됩니다.\n"
-        "• 한 번에 한 메시지만 처리 (다음 메시지는 큐에서 대기).",
+        "• 한 번에 한 메시지만 처리 (다음 메시지는 큐에서 대기).\n\n"
+        "회사 작업용:\n"
+        "• /work on/off — DLP-안전 모드. 코드 입력 X, 묘사만. 답변에 영문 "
+        "Copilot 프롬프트 포함.\n"
+        "• /abstract <텍스트> — 내부 용어 섞인 문장을 일반 산업 용어로 변환.",
     )
 
 
@@ -368,6 +398,106 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _safe_send(context.bot, update.effective_chat.id, "\n".join(lines))
 
 
+async def cmd_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle DLP-safe Work Mode for this chat."""
+    user = update.effective_user
+    if user is None or update.message is None or not _is_allowed(user.id):
+        return
+    chat_id = update.effective_chat.id
+    arg = ((context.args[0].lower() if context.args else "")).strip()
+
+    if arg in ("on", "1", "true"):
+        state.work_mode_chats.add(chat_id)
+        await _safe_send(
+            context.bot,
+            chat_id,
+            "✓ Work Mode ON (DLP 적용).\n"
+            "• 코드/내부 식별자 입력 X — 일반 묘사만\n"
+            "• 답변은 한국어 설명 + 영문 Copilot 프롬프트 코드블록\n"
+            "• /work off 로 해제",
+        )
+        return
+    if arg in ("off", "0", "false"):
+        state.work_mode_chats.discard(chat_id)
+        await _safe_send(context.bot, chat_id, "✓ Work Mode OFF. 평소 모드.")
+        return
+
+    status = "ON" if chat_id in state.work_mode_chats else "OFF"
+    await _safe_send(
+        context.bot,
+        chat_id,
+        f"Work Mode: 현재 {status}\n사용법: /work on | /work off",
+    )
+
+
+async def cmd_abstract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One-shot: rewrite a message in DLP-safe abstract form."""
+    user = update.effective_user
+    if user is None or update.message is None or not _is_allowed(user.id):
+        return
+    chat_id = update.effective_chat.id
+    raw = update.message.text or ""
+    args_text = raw.partition(" ")[2].strip()
+    if not args_text:
+        await _safe_send(
+            context.bot,
+            chat_id,
+            "사용법: /abstract <텍스트>\n"
+            "회사/제품/팀/내부 도메인 용어 섞인 문장을 DLP-안전한 일반 표현 + "
+            "영문 Copilot 프롬프트로 변환합니다.\n"
+            "예: /abstract 한영서비스 결제 환불 멱등성 처리",
+        )
+        return
+
+    if state.client is None:
+        await _safe_send(context.bot, chat_id, "[bot error] client not ready")
+        return
+
+    allowed, retry_in = _rate_limit_check(user.id)
+    if not allowed:
+        await _safe_send(
+            context.bot,
+            chat_id,
+            f"⏱ 분당 메시지 제한 초과. {int(retry_in) + 1}초 후 재시도.",
+        )
+        return
+
+    log.info(f"[{user.id}] /abstract → {args_text[:120]}")
+    state.notify_chats.add(chat_id)
+
+    prompt = (
+        "다음 텍스트를 DLP-안전하게 추상화해주세요. 회사/제품/팀/내부 도메인 단어를 "
+        "산업 일반 용어로 치환:\n\n"
+        f"{args_text}\n\n"
+        "출력 형식:\n"
+        "1. 추상화된 한국어 설명 (1-2줄)\n"
+        "2. 영문 Copilot 프롬프트 (```bash 또는 ```text 코드블록)"
+    )
+
+    async with state.lock:
+        typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
+        try:
+            await state.client.query(prompt)
+            parts: list[str] = []
+            async for msg in state.client.receive_response():
+                fragment = _render_message(msg)
+                if fragment:
+                    parts.append(fragment)
+            response = "\n".join(parts).strip() or "(no response)"
+        except Exception as exc:  # noqa: BLE001
+            log.exception("error processing /abstract")
+            response = f"[bot error] {exc}"
+        finally:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
+
+        for chunk in _split_message(response):
+            await _safe_send(context.bot, chat_id, chunk)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user is None or update.message is None:
@@ -401,7 +531,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
         response: str
         try:
-            await state.client.query(text)
+            prepared = (
+                WORK_MODE_TAG + text
+                if chat_id in state.work_mode_chats
+                else text
+            )
+            await state.client.query(prepared)
             parts: list[str] = []
             async for msg in state.client.receive_response():
                 fragment = _render_message(msg)
@@ -515,6 +650,8 @@ async def _main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("work", cmd_work))
+    app.add_handler(CommandHandler("abstract", cmd_abstract))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     await app.initialize()

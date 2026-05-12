@@ -93,7 +93,75 @@ launchctl load -w ~/Library/LaunchAgents/com.사장님.friday-bot.plist
 > 주의: launchd는 셸 환경을 상속하지 않음. `.env` 의 키들은 봇이 `python-dotenv`
 > 로 직접 로드하므로 OK.
 
-## 7. 보안 노트
+## 7. Work Mode (DLP-안전 자문)
+
+회사에서 일하는 동안 텔레그램으로 Friday에게 자문 받을 때 켜는 모드.
+
+**한 줄 원칙**: Friday는 코드 안 봐요. 사장님이 머리로 추상화한 묘사만 받아요.
+
+### 골든 패스
+
+```
+회사 PC 모니터  →  머리에서 추상화
+    ↓
+개인 폰 → Telegram → Friday (집 Mac)
+    ↓ 한국어 설명 + 영문 Copilot 프롬프트 코드블록
+개인 폰에서 읽음
+    ↓ 본인이 회사 PC에 직접 입력 (또는 패턴만 머리로 가져감)
+회사 PC → IDE Copilot 자동완성 / 입력
+```
+
+회사 코드/데이터가 텔레그램을 통과하는 채널이 0이라 DLP 안전.
+
+### 절대 금지 행동
+
+- 회사 PC에서 텔레그램 열기 (클립보드/네트워크 감시 위험)
+- 코드 캡처/복붙해서 폰으로 전송
+- 내부 식별자(회사명/제품명/팀명/내부 도메인 단어) 그대로 입력 → `/abstract` 사용
+
+### 명령어
+
+```
+/work          → 현재 상태 확인
+/work on       → Work Mode 켜기
+/work off      → 끄기
+/abstract <텍스트>  → 내부 용어 섞인 문장을 일반 산업 용어 + 영문 Copilot 프롬프트로 변환
+```
+
+### 사용 예
+
+```
+사장님: /work on
+봇: ✓ Work Mode ON. 코드 입력 X, 묘사만.
+
+사장님: 결제 환불에서 멱등성 처리 어떻게 해?
+봇: 3rd-party 결제 환불의 멱등성은 보통 3 레이어로:
+    1) request_id 기반 dedupe table
+    2) DB-level unique constraint
+    3) 외부 API 응답 재해석
+
+    Copilot에 넣어보세요:
+    ```
+    Add idempotency to refund endpoint:
+    - idempotency_keys table (key, status, response_hash, created_at)
+    - Check key before processing; return stored response on retry
+    - Compose unique constraint on (key, created_at)
+    ```
+```
+
+추상화 도움이 필요할 때:
+
+```
+사장님: /abstract HANSubPayService 환불 시 KAKAO_PAY 응답 처리
+봇: 1. 추상화: "3rd-party 결제 게이트웨이의 환불 응답 처리"
+    2. ```text
+       Handle refund response from third-party payment gateway,
+       parsing idempotency markers from response headers
+       ```
+```
+
+
+## 8. 보안 노트
 
 봇은 다음 가드레일을 코드 레벨에서 강제합니다:
 
@@ -129,7 +197,7 @@ launchctl load -w ~/Library/LaunchAgents/com.사장님.friday-bot.plist
 - 정규식 기반 차단은 우회 시도에 약함 (`s​udo` 같은 zero-width 삽입 등).
   완벽한 방어가 아니라 실수 방지용. 화이트리스트가 1차 방어선.
 
-## 8. 동작 방식
+## 9. 동작 방식
 
 - REPL과 동일한 `ClaudeSDKClient` 한 개를 봇 수명 내내 공유.
 - 한 번에 한 메시지만 처리(asyncio.Lock). 처리 중에 새 메시지가 와도
@@ -138,7 +206,7 @@ launchctl load -w ~/Library/LaunchAgents/com.사장님.friday-bot.plist
 - 백그라운드 잡 완료, PR 감시 알림 등은 5초마다 폴링해서 푸시.
 - Mac 슬립 들어가도 텔레그램 서버가 메시지 보관 → 깨어나면 받아 처리.
 
-## 9. 문제 해결
+## 10. 문제 해결
 
 | 증상 | 원인 / 해결 |
 |---|---|
